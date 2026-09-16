@@ -20,7 +20,8 @@ Script PowerShell que detecta e mapeia automaticamente toda a rede local, gerand
 - **Confirma impressoras automaticamente** via scan de portas específicas (9100/631/515), evitando falsos positivos de fabricantes de chip de rede genérico
 - **Detecta servidor DHCP não autorizado** — alerta quando mais de um servidor responde na mesma rede, indício forte de roteador/AP clandestino
 - **Lembra o que já escaneou** — pula automaticamente redes já mapeadas em execuções anteriores, útil ao testar vários pontos de rede em sequência
-- **Barra de progresso ao vivo** durante scans longos — linha única atualizada em tempo real com fase atual, % concluído e ETA dinâmico, além de um cronômetro do início ao fim da operação completa
+- **Escaneia várias redes em paralelo** (`-Rede 10.5.20.0/24,192.168.1.0/24`), com uma **tabela de log ao vivo** no console — uma linha por fase de cada rede, colorida por status, cronômetro por fase e um cronômetro do início ao fim da operação completa
+- **Numeração de registro + computador de origem** em toda execução, para rastrear/auditar scans ao longo do tempo
 - Gera **três formatos de saída**: CSV (planilha), resumo em texto, e um **relatório visual em HTML** pronto para apresentação (exporta direto para PDF)
 
 ## 📋 Requisitos
@@ -37,6 +38,9 @@ powershell -ExecutionPolicy Bypass -File .\scan-rede.ps1
 
 # Força uma faixa de rede específica
 powershell -ExecutionPolicy Bypass -File .\scan-rede.ps1 -Rede 10.5.20.0/24
+
+# Força várias faixas de uma vez - escaneadas em paralelo
+powershell -ExecutionPolicy Bypass -File .\scan-rede.ps1 -Rede 10.5.20.0/24,192.168.1.0/24
 
 # Escaneia mesmo que a rede já seja conhecida (ignora a memória de execuções anteriores)
 powershell -ExecutionPolicy Bypass -File .\scan-rede.ps1 -Forcar

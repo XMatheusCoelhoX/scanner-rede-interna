@@ -45,7 +45,7 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
    - Se **todas** já são conhecidas e `-Forcar` não foi passado → avisa e **encerra sem escanear**
    - Se há rede(s) **nova(s)** → prossegue só com as novas (ou com todas, se `-Forcar`)
 8. [ ] Para cada adaptador físico envolvido: roda a checagem de **DHCP não autorizado** (resolve o nome de interface que o Nmap reconhece via `nmap --iflist`, casando pelo IP; roda `nmap --script broadcast-dhcp-discover --script-timeout 20s`, com saída ao vivo no console e limite de 20s pra não travar esperando resposta que não vem)
-9. [ ] Para cada faixa de rede a escanear: roda `nmap -O -sV --osscan-guess --stats-every 3s -oX <arquivo>.xml <faixa>` em segundo plano via `Start-Process` (invocação direta do `nmap.exe`, sem passar por `cmd.exe`), com saída redirecionada para um arquivo temporário; enquanto o processo roda, o script exibe uma **barra de progresso de linha única** (atualizada com `\r`, sem quebra de linha) mostrando fase atual, % concluído e ETA, recalculados a cada segundo a partir do `--stats-every`
+9. [ ] Dispara **um `nmap.exe` por faixa de rede, todos ao mesmo tempo** (via `Start-Process`, não bloqueante, sem passar por `cmd.exe`), cada um com saída redirecionada para um arquivo temporário próprio; enquanto os processos rodam, o script desenha uma **tabela de log com bordas** no console (uma linha por evento de cada faixa — fase iniciada, marco de %, conclusão), com a linha da fase em andamento sendo **reescrita no próprio lugar** (via posicionamento absoluto do cursor) a cada ~300ms, e congelada como linha permanente quando a fase muda ou a faixa termina
 10. [ ] Lê o XML gerado e monta uma linha por host ativo (`status=up`), extraindo IP, MAC, fabricante, hostname, portas abertas, SO estimado
 11. [ ] Classifica cada host em um **Tipo Provável** (roteador/switch, PC/servidor, fabricante de contrato, MAC aleatório, etc.) cruzando o fabricante do MAC com listas conhecidas + checagem bit a bit do MAC
 12. [ ] Roda uma **confirmação extra de impressoras** (`nmap -Pn -p 9100,631,515`) só nos hosts cujo fabricante é ambíguo (chip de rede genérico tipo Realtek) — o `-Pn` evita falso negativo em impressoras com ICMP/ping bloqueado
@@ -64,6 +64,8 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 | `Aguardar-Saida` | Mantém a janela do console aberta no fim da execução (sucesso ou erro) |
 | `Test-Administrador` | Verifica se o processo atual tem privilégio de administrador |
 | `Get-CaminhoRedesConhecidas` / `Get-RedesConhecidas` / `Save-RedeConhecida` | Leitura/escrita da "memória" de redes já escaneadas (`redes_conhecidas.json`) |
+| `Get-ProximoNumeroRegistro` | Incrementa e persiste o número de registro sequencial da execução (`registro_scans.json`) |
+| `Get-NomeComputadorCompleto` | Resolve o nome completo (FQDN) do computador de origem, com fallback para o nome curto do Windows |
 | `Invoke-NmapCapturado` | Roda o Nmap capturando stdout+stderr juntos sem deixar avisos em stderr virarem erro fatal do PowerShell (ver seção 12) |
 | `Install-Nmap` | Baixa, valida assinatura digital, e instala o Nmap silenciosamente |
 | `Test-EquipamentoDeRede` | Verifica se o fabricante do MAC bate com marca conhecida de roteador/switch/AP |
@@ -76,7 +78,12 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 | `ConvertTo-TextoHtml` | Escapa caracteres especiais (`&`, `<`, `>`, `"`) para uso seguro dentro do HTML |
 | `New-RelatorioHtml` | Gera o relatório visual em HTML (`relatorio_<data>.html`), incluindo o tempo total da execução |
 | `Format-Decorrido` | Formata um `TimeSpan` como `mm:ss` ou `hh:mm:ss` para exibição |
-| `Invoke-NmapComBarraDeProgresso` | Roda o scan principal em segundo plano e desenha a barra de progresso de linha única no console (ver seção 12) |
+| `Enable-AnsiConsole` | Habilita processamento de sequências ANSI/VT no console via P/Invoke (`SetConsoleMode`); define `$script:corSuportada` |
+| `Format-TextoTruncado` / `Format-TextoCentralizado` | Cortam e/ou centralizam texto numa largura fixa de coluna, usados por toda a tabela de log |
+| `Format-BordaTabela` | Desenha as linhas de borda da tabela (topo/meio/base) com caracteres Unicode de desenho de caixa |
+| `Format-LinhaTabelaLog` | Formata uma linha de dados (ou o cabeçalho) da tabela de log, colorida por rede/status |
+| `Write-LinhaLogParalelo` | Escreve ou reescreve (no mesmo lugar, via `[Console]::SetCursorPosition`) uma linha da tabela de log |
+| `Invoke-NmapsComLogParalelo` | Dispara um Nmap por faixa em paralelo e conduz a tabela de log ao vivo até todas terminarem (ver seção 13) |
 | `ConvertTo-CIDR` | Calcula o endereço de rede (CIDR) a partir de um IP + tamanho de prefixo |
 | `Wait-RedesLocaisAtivas` / `Get-RedesLocaisAtivas` | Detecção da(s) rede(s) local(is) ativa(s), com espera/retentativa para dar tempo ao DHCP |
 
@@ -87,14 +94,15 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 | Arquivo | Onde | Quando é criado | O que contém |
 |---|---|---|---|
 | `redes_conhecidas.json` | Pasta do script | Após o primeiro scan completo | Lista de redes CIDR já escaneadas, com data da 1ª e última vez, e quantas vezes |
+| `registro_scans.json` | Pasta do script | Na primeira execução | Contador do número de registro sequencial (`UltimoNumero`) |
 | `nmap\nmap.exe` | Pasta do script (opcional) | Manual, se você quiser evitar o download automático | Cópia local do Nmap |
-| `resultados\scan_<rede>_<data>.xml` | resultados\ | A cada faixa escaneada | Saída bruta e completa do Nmap (formato XML) |
+| `resultados\scan_<rede>_<data>.xml` | resultados\ | A cada faixa escaneada (em paralelo) | Saída bruta e completa do Nmap (formato XML) |
 | `resultados\dhcp_check_<adaptador>_<data>.txt` | resultados\ | A cada checagem de DHCP | Saída bruta do script NSE `broadcast-dhcp-discover` |
 | `resultados\confirmacao_impressoras_<data>.txt` | resultados\ | Quando há suspeitos de impressora | Saída do scan focado nas portas 9100/631/515 |
 | `resultados\inventario_<data>.csv` | resultados\ | Ao final de cada execução | Inventário completo, uma linha por dispositivo — abre no Excel |
-| `resultados\resumo_<data>.txt` | resultados\ | Ao final de cada execução | Resumo agregado em texto simples, incluindo tempo total da execução |
+| `resultados\resumo_<data>.txt` | resultados\ | Ao final de cada execução | Resumo agregado em texto simples, incluindo número de registro, computador e tempo total da execução |
 | `resultados\relatorio_<data>.html` | resultados\ | Ao final de cada execução | Relatório visual, pronto para apresentação/impressão em PDF |
-| `resultados\<rotulo>.progresso.log` / `.progresso.err.log` | resultados\ | Temporário, durante o scan principal | stdout/stderr do Nmap redirecionados para leitura da barra de progresso — **apagados automaticamente** ao final de cada faixa escaneada (não ficam no disco depois) |
+| `resultados\scan_<rede>_<data>.progresso.log` / `.progresso.err.log` | resultados\ | Temporário, durante o scan de cada faixa (em paralelo) | stdout/stderr do Nmap redirecionados para leitura da tabela de log — **apagados automaticamente** ao final de cada faixa escaneada (não ficam no disco depois) |
 
 ---
 
@@ -112,6 +120,8 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 | `SO_Estimado` | Palpite de sistema operacional (`-O` do Nmap), pode vir vazio se não houver confiança suficiente |
 | `PortasAbertas` | Lista de `porta/protocolo(serviço versão)` de todas as portas abertas encontradas |
 | `DataScan` | Timestamp da execução (`yyyy-MM-dd_HHmmss`) |
+| `NumeroRegistro` | Número de registro sequencial da execução, de `Get-ProximoNumeroRegistro` (`registro_scans.json`) |
+| `ComputadorOrigem` | Nome completo (FQDN) ou nome curto do computador de origem, de `Get-NomeComputadorCompleto` |
 
 ---
 
@@ -143,7 +153,7 @@ Ordem de avaliação (a primeira regra que bater, vale):
 | Parâmetro | Uso |
 |---|---|
 | (nenhum) | Detecta a rede automaticamente e escaneia |
-| `-Rede <CIDR>` | Força uma faixa específica, pulando a detecção automática (ex: `-Rede 10.5.20.0/24`) |
+| `-Rede <CIDR>[,<CIDR>...]` | Força uma ou mais faixas específicas, pulando a detecção automática (ex: `-Rede 10.5.20.0/24` ou `-Rede 10.5.20.0/24,192.168.1.0/24`). Múltiplas faixas são escaneadas em paralelo |
 | `-Forcar` | Ignora a memória de redes já conhecidas e escaneia mesmo assim |
 
 ---
@@ -194,9 +204,29 @@ Revisão linha a linha do script inteiro + testes reais contra o Nmap (incluindo
 - [x] Nenhum outro uso de `Start-Process` no script tem o padrão de risco encontrado no item crítico acima
 
 ### Backlog identificado (não crítico, não corrigido nesta rodada)
-- [ ] Sem timeout de segurança geral para o processo do Nmap no scan principal — se travar por motivo externo (driver, rede), a barra de progresso rodaria indefinidamente até o processo terminar sozinho
+- [ ] Sem timeout de segurança geral para o processo do Nmap no scan principal — se travar por motivo externo (driver, rede), a tabela de log ficaria parada esperando aquele processo terminar sozinho
 - [ ] `Aguardar-Saida` assume execução interativa (console real); impede automação totalmente não-interativa (ex: tarefa agendada) sem adicionar um parâmetro tipo `-SemPausa` no futuro
 - [ ] Checagem por fabricante literalmente `"Unknown"`/`"desconhecido"` em `Get-TipoProvavel` é código morto — o Nmap nunca emite esse texto, só omite o atributo quando não reconhece o OUI (já coberto pelo `-not $fabricante`). Inofensivo, mas redundante
+- [ ] `[Console]::SetCursorPosition` (usado por `Write-LinhaLogParalelo` para reescrever a linha "viva") assume janela larga o bastante (~110 colunas) e buffer que não role para fora durante a execução; em janela muito estreita ou sessão extremamente longa, cai (com `try/catch`) para o comportamento de só acrescentar linha nova, sem travar
+
+---
+
+## 13. Evolução técnica — 16/09/2026, sessão 2 (paralelismo real + log em tabela)
+
+Depois da auditoria da seção 12, o mecanismo de progresso evoluiu de uma barra sequencial (uma faixa por vez) para paralelismo real com log em tabela. Resumo técnico:
+
+- **Paralelismo:** `Invoke-NmapsComLogParalelo` dispara um `Start-Process` por faixa (não bloqueante) e acompanha todos simultaneamente num único loop de polling (~300ms), em vez do antigo `foreach` sequencial com `Invoke-NmapComBarraDeProgresso` (função removida).
+- **Renderização:** tabela com bordas Unicode (`Format-BordaTabela`), colunas de largura fixa (hora/rede/fase/%/eta/status), coloridas por rede (`$script:paletaCoresRede`, cicla ciano/roxo/amarelo/azul) e por status (`iniciado`=ciano, `em andamento`=amarelo, `concluido`=verde, `erro`=vermelho).
+- **Linha "viva":** enquanto uma fase está em andamento, a linha correspondente é reescrita no próprio lugar via `[Console]::SetCursorPosition` (guardado em `$t.LinhaViva` por tarefa) a cada volta do loop — inclusive a coluna "hora", que atualiza a cada ~300ms independente de o Nmap ter reportado percentual novo (heartbeat), para parecer um cronômetro de verdade em vez de ficar travada entre leituras.
+- **Congelamento:** ao detectar mudança de fase ou término do processo, a linha viva é reescrita uma última vez com o resultado final (`concluido`) e uma nova linha permanente é aberta para a próxima fase — preserva o histórico completo rolável no console.
+- **Fallback sem ANSI:** quando `$script:corSuportada` é falso (console sem VT, ou saída redirecionada), a tabela ainda é desenhada (bordas Unicode não dependem de ANSI), mas sem cor e sem reescrita no lugar — cada evento vira uma linha nova.
+
+### Bugs corrigidos nesta evolução (todos via reprodução real, não só revisão)
+
+- [x] **🔴 Crítica — script inteiro parava de rodar** (`TerminatorExpectedAtEndOfString`) ao introduzir os caracteres de bloco (`█`/`░`) da barra visual. Causa: `scan-rede.ps1` não tinha BOM UTF-8; sem BOM, o parser do PowerShell lê o arquivo pela codepage ANSI do sistema, e os bytes daqueles caracteres colidem com "aspas inteligentes" Unicode (`U+2018`/`U+2019`) que o parser aceita como delimitador alternativo de string literal, quebrando a sintaxe do arquivo inteiro. Corrigido adicionando BOM UTF-8 (`New-Object System.Text.UTF8Encoding($true)`).
+- [x] **🟡 Média — spinner/barra apareciam como retângulos vazios ("tofu")** no console real, mesmo sem erro de execução. Causa: codepage do console não estava em UTF-8. Corrigido com `chcp.com 65001` + `[Console]::OutputEncoding = [Text.Encoding]::UTF8` logo após a autoelevação, com fallback silencioso (`try/catch`) se o console não suportar.
+- [x] **🟡 Média — fase longa do Nmap desalinhava a tabela inteira.** Nomes como `Parallel DNS resolution of N hosts.` (mais compridos que a coluna) estouravam para o lado e quebravam o alinhamento de todas as colunas seguintes daquela linha. Corrigido com `Format-TextoTruncado`, aplicado antes de qualquer padding/centralização.
+- [x] **🟢 Baixa — `-Rede` com múltiplas faixas não sobrevivia à autoelevação.** `Start-Process -File` (usado no relançamento elevado) não faz o split automático de vírgula que o parser do PowerShell faz numa invocação direta (`-Rede a,b`). Corrigido normalizando `$Rede` logo após o `param()` (`$_ -split ','`), cobrindo os dois casos de entrada.
 
 ---
 

@@ -38,7 +38,7 @@ Usa a API .NET (`System.Net.NetworkInformation.NetworkInterface`) para achar os 
 
 Se você acabou de plugar o cabo, o Windows pode levar alguns segundos negociando o IP via DHCP — o script **espera até ~30 segundos**, tentando a cada 3s, antes de desistir. Isso é pensado justamente para o cenário de "cheguei agora, plug no cabo, rodei o script na hora".
 
-Você pode pular essa detecção e forçar uma faixa manualmente com `-Rede 10.5.20.0/24`.
+Você pode pular essa detecção e forçar uma faixa manualmente com `-Rede 10.5.20.0/24`, ou forçar **várias faixas de uma vez** separadas por vírgula: `-Rede 10.5.20.0/24,192.168.1.0/24` — elas são escaneadas **em paralelo** (ver Passo 6).
 
 ### Passo 4.5 — Comparação com redes já conhecidas (pré-teste automático)
 O script guarda, num arquivo `redes_conhecidas.json` ao lado dele, toda faixa CIDR que já escaneou por completo alguma vez (com data da primeira e da última vez).
@@ -69,8 +69,8 @@ Pra resolver isso **em qualquer computador**, sem hardcoded nada, o script:
 
 Se por algum motivo essa resolução falhar (formato de saída inesperado, versão muito diferente de Nmap/Npcap) o script **não trava** — ele avisa e pula só essa checagem específica, seguindo normalmente para o scan principal, que não depende dela.
 
-### Passo 6 — Execução do scan (com barra de progresso ao vivo)
-Para cada faixa detectada (ou forçada), roda:
+### Passo 6 — Execução do scan (todas as faixas em paralelo, com log em tabela)
+Todas as faixas detectadas (ou forçadas via `-Rede`) são escaneadas **ao mesmo tempo** — um processo de Nmap por faixa, disparados juntos com `Start-Process` (não bloqueante) — em vez de uma atrás da outra. Cada faixa roda:
 
 ```
 nmap -O -sV --osscan-guess --stats-every 3s -oX <arquivo>.xml <faixa>
@@ -84,19 +84,29 @@ nmap -O -sV --osscan-guess --stats-every 3s -oX <arquivo>.xml <faixa>
 | `--stats-every 3s` | Faz o Nmap recalcular e reportar percentual/ETA a cada 3 segundos |
 | `-oX` | Salva a saída bruta em formato XML (arquivo intermediário — o relatório final em HTML só é gerado depois que **todas** as faixas terminam de escanear) |
 
-O Nmap não roda direto no console — a função `Invoke-NmapComBarraDeProgresso` executa ele em segundo plano (via `Start-Process`, com a saída redirecionada para um arquivo temporário) e desenha **uma única linha viva no terminal**, atualizada no lugar (usando retorno de carro `\r`, sem quebrar linha a cada atualização), mostrando:
+A função `Invoke-NmapsComLogParalelo` acompanha todos os processos e desenha uma **tabela de log com bordas** no console, uma linha por evento de cada faixa:
 
 ```
-[decorrido 02:14] Service scan: 66,7% concluido, tempo restante estimado: 0:01:03
+  ┌────────┬─────────────────────────┬─────────────────────┬─────────┬────────────┬──────────────────────────┐
+  │  hora  │          rede           │         fase         │    %    │    eta     │          status          │
+  ├────────┼─────────────────────────┼─────────────────────┼─────────┼────────────┼──────────────────────────┤
+  │  00:00 │     192.168.111.0/24    │ -                    │  0.0%   │     -      │ iniciado                 │
+  │  00:06 │     192.168.111.0/24    │ ARP Ping Scan        │ 100.0%  │     -      │ concluido                │
+  │  00:24 │     192.168.111.0/24    │ SYN Stealth Scan     │ 84,9%   │  0:00:11   │ em andamento             │
+  └────────┴─────────────────────────┴─────────────────────┴─────────┴────────────┴──────────────────────────┘
 ```
 
-- **Tempo decorrido**: cronômetro daquela faixa específica, atualizado a cada segundo
-- **Fase atual**: qual etapa do Nmap está rodando (`SYN Stealth Scan`, `Service scan`, `NSE`, etc.)
-- **% concluído e tempo restante estimado**: recalculado pelo próprio Nmap a cada atualização — varia sozinho conforme a velocidade real do scan muda (fica mais rápido/lento dependendo de quantos hosts respondem, congestionamento da rede, etc.)
+Comportamento das linhas:
+- **Enquanto uma fase está em andamento**, a linha dela é **reescrita no próprio lugar** (via posicionamento absoluto do cursor do console) a cada ~300ms — hora, % e ETA vão atualizando como um cronômetro de verdade, sem gerar uma linha nova a cada leitura.
+- **Quando a fase muda** (ex: de "SYN Stealth Scan" para "Service scan") ou a faixa **termina**, aquela linha fica **congelada** com o resultado final (`concluido`, em verde) e uma **linha nova e permanente** começa para a próxima fase — o histórico completo de cada etapa concluída continua rolável no console (útil para auditoria).
+- Cada rede ganha uma **cor própria** (cicla entre ciano/roxo/amarelo/azul) para dar pra acompanhar várias faixas ao mesmo tempo sem confundir qual linha é de qual rede.
+- Cores de status: `iniciado` = ciano, `em andamento` = amarelo, `concluido` = verde, `erro` = vermelho.
+- Colunas hora/rede/%/ETA ficam centralizadas; fase/status ficam alinhadas à esquerda (mais fácil de ler textos variáveis). Qualquer valor mais comprido que a coluna é cortado, para nunca desalinhar a tabela.
+- Em consoles sem suporte a ANSI (saída redirecionada para arquivo, por exemplo), o script cai automaticamente para o mesmo log em texto simples, sem cor e sem reescrever linhas no lugar (cada evento vira uma linha nova).
 
 Separadamente, também existe um cronômetro da **execução inteira** (do início ao fim — inclui checagem de DHCP, todas as faixas, confirmação de impressoras e geração dos relatórios), mostrado na mensagem final e salvo no resumo/HTML.
 
-> **Nota de auditoria (corrigido):** a primeira versão dessa barra de progresso tinha um bug de aspas que fazia o scan **falhar silenciosamente** (sem gerar erro nem XML) em qualquer caminho de pasta com espaço — que é exatamente o caso deste projeto (`...\Matheus Coelho\...`). Duas causas foram encontradas e corrigidas: (1) enviar o comando pronto como uma string única para `cmd.exe` fazia o PowerShell requotar por cima e quebrar o parsing; (2) depois de trocar para invocar o Nmap diretamente, descobriu-se que `Start-Process -ArgumentList` **não** coloca aspas automáticas em argumentos com espaço (diferente do operador `&` usado no resto do script) — corrigido citando manualmente cada argumento antes de passar. Testado e confirmado funcionando com o caminho real do projeto.
+> **Nota de auditoria/evolução:** a primeira versão desse recurso era uma única barra de progresso sequencial (uma faixa por vez), com um bug de aspas que fazia o scan **falhar silenciosamente** (sem gerar erro nem XML) em qualquer caminho de pasta com espaço — que é exatamente o caso deste projeto (`...\Matheus Coelho\...`). Corrigido citando manualmente cada argumento antes de passar para `Start-Process -ArgumentList` (que, diferente do operador `&` usado no resto do script, não cita automaticamente). Depois evoluiu para o paralelismo real de múltiplas faixas com o log em tabela descrito acima, incluindo a correção de um bug de codepage do console (Windows não processava os caracteres de bloco/spinner corretamente sem `chcp 65001` + `[Console]::OutputEncoding`) e de um bug de desalinhamento (nomes de fase muito longos do Nmap, como `Parallel DNS resolution of N hosts.`, estouravam a largura da coluna e quebravam a tabela — corrigido truncando qualquer valor antes de alinhar).
 
 ### Passo 7 — Geração do inventário (CSV)
 Lê o XML gerado e monta uma tabela com uma linha por dispositivo ativo encontrado:
@@ -113,6 +123,8 @@ Lê o XML gerado e monta uma tabela com uma linha por dispositivo ativo encontra
 | SO_Estimado | Palpite de sistema operacional do Nmap |
 | PortasAbertas | Lista de portas abertas com serviço/versão detectados |
 | DataScan | Timestamp da execução |
+| NumeroRegistro | Número de registro sequencial da execução (ex: `000007`) — ver seção 2.1 |
+| ComputadorOrigem | Nome (FQDN quando disponível) do computador de onde o scan foi rodado |
 
 Salva em: `resultados\inventario_<data>_<hora>.csv` (abre direto no Excel).
 O XML bruto de cada faixa também fica salvo em `resultados\`, caso precise reprocessar depois.
@@ -145,6 +157,7 @@ scanner-rede\
 ├── scan-rede.ps1              <- o script
 ├── LEIA-ME.md                 <- este documento
 ├── redes_conhecidas.json      <- memoria das redes ja escaneadas (criado automaticamente)
+├── registro_scans.json        <- contador do numero de registro sequencial (criado automaticamente)
 ├── nmap\                      <- opcional: coloque aqui o Nmap se quiser evitar o download automático
 │   └── nmap.exe
 └── resultados\                <- criado automaticamente na primeira execução
@@ -155,6 +168,16 @@ scanner-rede\
     ├── resumo_<data>.txt                    <- resumo em texto
     └── relatorio_<data>.html                <- relatorio visual para apresentacao (abrir no navegador, Ctrl+P -> PDF)
 ```
+
+### 2.1 — Número de registro e computador de origem
+Toda execução ganha um **número de registro sequencial** (`000001`, `000002`, ...), guardado em `registro_scans.json` ao lado do script — incrementa a cada execução, independente do timestamp, e serve como identificador único para rastrear/auditar execuções ao longo do tempo (inclusive comparando execuções feitas em máquinas diferentes).
+
+Junto, o script identifica o **nome completo do computador** de origem (FQDN via DNS quando disponível, ex: `PMPS-DT-52573.dominio.local`; cai para o nome curto do Windows — ex: `PMPS-DT-52573` — se não houver domínio/DNS configurado).
+
+Ambos aparecem:
+- No console, logo no início da execução: `Registro N. 000007  -  Computador: PMPS-DT-52573`
+- No resumo em texto e no relatório HTML (cabeçalho)
+- Como colunas no CSV (`NumeroRegistro`, `ComputadorOrigem`), em toda linha do inventário
 
 ---
 
@@ -206,9 +229,20 @@ Auditoria completa do script (revisão linha a linha + testes reais contra o Nma
 - Nenhum outro uso de `Start-Process` no script tem o padrão de risco do item #1
 
 ### Backlog (identificado, não crítico, não corrigido nesta rodada)
-- Sem timeout de segurança geral se o processo do Nmap travar por algum motivo externo (driver, rede) durante o scan principal — hoje a barra de progresso ficaria rodando indefinidamente até o processo terminar sozinho
+- Sem timeout de segurança geral se o processo do Nmap travar por algum motivo externo (driver, rede) durante o scan principal — hoje o log ficaria parado esperando aquele processo terminar sozinho
 - `Aguardar-Saida` (pausa no final com "Pressione Enter") assume execução interativa; se alguém tentar rodar o script de forma totalmente automatizada/agendada (sem console interativo), essa pausa bloquearia indefinidamente — não é um problema para o uso pretendido (execução manual, interativa), mas impede automação futura sem um parâmetro tipo `-SemPausa`
 - Um trecho de código em `Get-TipoProvavel` checa por fabricante literalmente igual a `"Unknown"`/`"desconhecido"`, mas o Nmap nunca emite esse texto (ele só omite o atributo quando não reconhece o fabricante) — código inofensivo mas nunca executado na prática, poderia ser removido em uma limpeza futura
+- O reposicionamento de cursor usado para reescrever a linha "viva" de cada fase (`[Console]::SetCursorPosition`) assume uma janela de console larga o bastante para a linha não quebrar (~110 colunas) e um buffer de tela que não role para fora do histórico durante a execução — ambos verdadeiros no uso normal, mas em janelas muito estreitas ou sessões extremamente longas o reposicionamento pode falhar; nesse caso o script cai para o comportamento de só acrescentar linha nova (sem travar), sem quebrar a execução
+
+### Sessão de evolução — 16/09/2026 (paralelismo real + log em tabela)
+Depois da auditoria acima, o recurso de progresso evoluiu de uma barra única sequencial para o **log em tabela com paralelismo real** descrito no Passo 6, junto com a numeração de registro e identificação do computador de origem (seção 2.1). Bugs encontrados e corrigidos durante essa evolução, todos via reprodução real (não só revisão de código):
+
+| # | Severidade | Problema | Causa raiz | Correção |
+|---|---|---|---|---|
+| 4 | 🔴 Crítica | O script inteiro parava de funcionar (`TerminatorExpectedAtEndOfString`) ao adicionar os caracteres de bloco (`█`/`░`) usados na barra visual | O arquivo `scan-rede.ps1` não tinha BOM UTF-8; sem ele, o parser do PowerShell lê o arquivo pela codepage ANSI do sistema, e os bytes daqueles caracteres colidem com "aspas inteligentes" Unicode que o parser aceita como delimitador de string, quebrando a sintaxe | Adicionado BOM UTF-8 ao arquivo (`[System.Text.UTF8Encoding($true)]`) — também elimina qualquer mojibake latente nos textos em português já existentes |
+| 5 | 🟡 Média | Spinner e barra apareciam como caracteres vazios ("tofu"/retângulos) no console real, mesmo com o script rodando sem erro | A codepage do console do Windows não estava em UTF-8 (65001); o .NET mandava bytes UTF-8 mas o `conhost` interpretava com outra codepage | Adicionado `chcp.com 65001` + `[Console]::OutputEncoding = [Text.Encoding]::UTF8` logo após a autoelevação |
+| 6 | 🟡 Média | Nomes de fase longos do Nmap (ex: `Parallel DNS resolution of 13 hosts.`) estouravam a largura da coluna "fase" e desalinhavam toda a tabela daquela linha em diante | A função de formatação da linha não cortava valores mais compridos que a coluna antes de alinhar | Adicionado `Format-TextoTruncado`, aplicado a todas as colunas de largura fixa antes do alinhamento/centralização |
+| 7 | 🟢 Baixa | `-Rede` com múltiplas faixas (`-Rede a,b`) não funcionava quando o script se autoelevava (relançava a si mesmo) | `Start-Process -File` não reaplica o split automático de vírgula que o parser do PowerShell faz numa invocação direta | Normalização explícita logo após o `param()` (`$_ -split ','`), que cobre os dois casos (array já separado ou string única com vírgulas vinda do relançamento) |
 
 ---
 

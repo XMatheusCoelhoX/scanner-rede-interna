@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Detecta a rede local automaticamente, instala o Nmap se necessario, e a
     escaneia gerando um inventario em CSV. Pensado para rodar de um pen drive
@@ -17,9 +17,11 @@
        script.
 
 .PARAMETER Rede
-    Opcional. Forca uma faixa CIDR especifica (ex: 10.5.20.0/24) em vez de
-    detectar automaticamente. Use se a deteccao automatica escolher a rede
-    errada (ex: PC com VPN corporativa ligada).
+    Opcional. Forca uma ou mais faixas CIDR especificas (ex: 10.5.20.0/24) em vez
+    de detectar automaticamente. Use se a deteccao automatica escolher a rede
+    errada (ex: PC com VPN corporativa ligada). Aceita varias faixas separadas
+    por virgula (ex: -Rede 10.5.20.0/24,192.168.1.0/24) - elas sao escaneadas
+    em paralelo, uma linha de log por evento de cada faixa.
 
 .PARAMETER Forcar
     Opcional. Roda o scan completo mesmo se a rede detectada ja for conhecida
@@ -37,9 +39,17 @@
 #>
 
 param(
-    [string]$Rede,
+    [string[]]$Rede,
     [switch]$Forcar
 )
+
+# Normaliza -Rede pra sempre virar uma lista de faixas individuais, independente de
+# como chegou: digitado direto no console (10.5.20.0/24,192.168.1.0/24 ja vira array
+# por conta do parser do PowerShell) ou passado como uma unica string com virgulas
+# (caso do relancamento apos a autoelevacao, que nao faz esse split automatico).
+if ($Rede) {
+    $Rede = @($Rede | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
 
 # Mantem a janela aberta no final (sucesso ou erro) quando rodado por duplo-clique/atalho,
 # para que mensagens de erro nao "sumam" com o fechamento automatico do console.
@@ -52,6 +62,38 @@ function Aguardar-Saida {
 
 function Get-CaminhoRedesConhecidas {
     return Join-Path $PSScriptRoot "redes_conhecidas.json"
+}
+
+function Get-ProximoNumeroRegistro {
+    # Numero de registro sequencial (independente do timestamp) para rastrear/auditar
+    # execucoes do scanner ao longo do tempo, mesmo em maquinas diferentes. Persistido
+    # ao lado do script, igual a memoria de redes conhecidas.
+    $caminho = Join-Path $PSScriptRoot "registro_scans.json"
+    $ultimo = 0
+    if (Test-Path $caminho) {
+        try {
+            $conteudo = Get-Content $caminho -Raw | ConvertFrom-Json
+            $ultimo = [int]$conteudo.UltimoNumero
+        } catch {
+            Write-Host "Aviso: nao foi possivel ler o contador de registro ($caminho). Reiniciando a partir de 1." -ForegroundColor Yellow
+        }
+    }
+
+    $numero = $ultimo + 1
+    [PSCustomObject]@{ UltimoNumero = $numero } | ConvertTo-Json | Out-File -FilePath $caminho -Encoding UTF8
+    return "{0:D6}" -f $numero
+}
+
+function Get-NomeComputadorCompleto {
+    # Tenta o nome completo (FQDN, ex: PC-TI01.empresa.local) e cai para o nome curto
+    # do Windows (ex: PC-TI01) se a maquina nao tiver DNS/dominio configurado.
+    try {
+        $fqdn = [Net.Dns]::GetHostEntry([Net.Dns]::GetHostName()).HostName
+        if ($fqdn) { return $fqdn }
+    } catch {
+        # Sem resolucao DNS disponivel - segue com o nome curto abaixo.
+    }
+    return $env:COMPUTERNAME
 }
 
 function Invoke-NmapCapturado {
@@ -347,7 +389,9 @@ function New-RelatorioResumo {
         [array]$AlertasDhcp,
         [string]$Timestamp,
         [string]$PastaResultados,
-        [string]$TempoTotal = ""
+        [string]$TempoTotal = "",
+        [string]$NumeroRegistro = "",
+        [string]$Computador = ""
     )
 
     $linhasTexto = New-Object System.Collections.Generic.List[string]
@@ -356,6 +400,8 @@ function New-RelatorioResumo {
     & $add "========================================================"
     & $add "  RESUMO DO SCAN DE REDE"
     & $add "========================================================"
+    if ($NumeroRegistro) { & $add "Numero de registro: $NumeroRegistro" }
+    if ($Computador) { & $add "Computador de origem: $Computador" }
     & $add "Data/Hora: $(Get-Date -Date ([datetime]::ParseExact($Timestamp,'yyyy-MM-dd_HHmmss',$null)) -Format 'dd/MM/yyyy HH:mm:ss')"
     if ($TempoTotal) { & $add "Tempo total da execucao (inicio ao fim): $TempoTotal" }
     & $add ""
@@ -450,7 +496,9 @@ function New-RelatorioHtml {
         [array]$AlertasDhcp,
         [string]$Timestamp,
         [string]$PastaResultados,
-        [string]$TempoTotal = ""
+        [string]$TempoTotal = "",
+        [string]$NumeroRegistro = "",
+        [string]$Computador = ""
     )
 
     $Faixas = @($Faixas)
@@ -634,6 +682,8 @@ function New-RelatorioHtml {
   <div class="topo">
     <h1>Relatorio de Inventario de Rede Interna</h1>
     <div class="meta">
+      $(if ($NumeroRegistro) { "<span class='pill'>Registro N&#186; $(ConvertTo-TextoHtml $NumeroRegistro)</span>" })
+      $(if ($Computador) { "<span class='pill'>Computador: $(ConvertTo-TextoHtml $Computador)</span>" })
       <span class="pill">Gerado em $dataFormatada</span>
       <span class="pill">$($Faixas.Count) rede(s) escaneada(s)</span>
       <span class="pill">$($Faixas -join ', ')</span>
@@ -713,62 +763,298 @@ function Format-Decorrido([TimeSpan]$tempo) {
     return "{0:00}:{1:00}" -f $tempo.Minutes, $tempo.Seconds
 }
 
-function Invoke-NmapComBarraDeProgresso {
+# Sequencias ANSI para a barra de progresso moderna. O console do Windows 10/11
+# (build >= 10586) processa VT nativamente, mas so quando o modo e habilitado
+# explicitamente no handle de saida - por isso a chamada abaixo via P/Invoke.
+# Se falhar (ex: saida redirecionada para arquivo), o script cai de volta para
+# texto puro sem cor, sem quebrar nada.
+$script:corSuportada = $false
+function Enable-AnsiConsole {
+    try {
+        $definicao = @'
+using System;
+using System.Runtime.InteropServices;
+public static class VtConsole {
+    [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int h);
+    [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr hConsole, out uint mode);
+    [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr hConsole, uint mode);
+}
+'@
+        if (-not ("VtConsole" -as [type])) {
+            Add-Type -TypeDefinition $definicao -ErrorAction Stop
+        }
+        $handle = [VtConsole]::GetStdHandle(-11)
+        $modo = 0
+        if ([VtConsole]::GetConsoleMode($handle, [ref]$modo)) {
+            [VtConsole]::SetConsoleMode($handle, $modo -bor 0x0004) | Out-Null
+            $script:corSuportada = $true
+        }
+    } catch {
+        $script:corSuportada = $false
+    }
+}
+Enable-AnsiConsole
+
+$script:ansiEsc      = [char]27
+$script:ansiReset    = "$($script:ansiEsc)[0m"
+$script:ansiCiano    = "$($script:ansiEsc)[1;96m"
+$script:ansiAmarelo  = "$($script:ansiEsc)[93m"
+$script:ansiVerde    = "$($script:ansiEsc)[1;92m"
+$script:ansiVermelho = "$($script:ansiEsc)[1;91m"
+$script:ansiRoxo     = "$($script:ansiEsc)[1;95m"
+$script:ansiAzul     = "$($script:ansiEsc)[1;94m"
+$script:ansiLaranja  = "$($script:ansiEsc)[38;5;208m"
+$script:ansiCinza    = "$($script:ansiEsc)[90m"
+$script:ansiBranco   = "$($script:ansiEsc)[1;97m"
+$script:spinnerFrames = @('|', '/', '-', '\')
+# Uma cor por rede (cicla se houver mais redes que cores), so pra dar pra acompanhar
+# visualmente qual linha do log pertence a qual faixa no meio de varias rodando juntas.
+$script:paletaCoresRede = @($script:ansiCiano, $script:ansiRoxo, $script:ansiAmarelo, $script:ansiAzul)
+
+function Format-TextoTruncado([string]$Texto, [int]$Largura) {
+    # Corta o texto na largura da coluna antes de alinhar - sem isso, um valor mais
+    # comprido que a coluna (ex: nome de fase longo do nmap) estoura pro lado e
+    # desalinha todas as colunas seguintes daquela linha.
+    if ($Texto.Length -gt $Largura) { return $Texto.Substring(0, $Largura) }
+    return $Texto
+}
+
+function Format-TextoCentralizado([string]$Texto, [int]$Largura) {
+    $Texto = Format-TextoTruncado $Texto $Largura
+    $espaco = $Largura - $Texto.Length
+    $esquerda = [int][Math]::Floor($espaco / 2)
+    $direita = $espaco - $esquerda
+    return (' ' * $esquerda) + $Texto + (' ' * $direita)
+}
+
+# Larguras das colunas da tabela de log, na ordem hora/rede/fase/%/eta/status. Um so
+# lugar pra manter as bordas (Format-BordaTabela) e as celulas (Format-LinhaTabelaLog)
+# sempre alinhadas entre si.
+$script:larguraColunasLog = @(8, 23, 19, 7, 10, 24)
+
+function Format-BordaTabela([string]$Tipo) {
+    switch ($Tipo) {
+        'Topo' { $esq = [char]0x250C; $meio = [char]0x252C; $dir = [char]0x2510 }
+        'Meio' { $esq = [char]0x251C; $meio = [char]0x253C; $dir = [char]0x2524 }
+        'Base' { $esq = [char]0x2514; $meio = [char]0x2534; $dir = [char]0x2518 }
+    }
+    $traco = [char]0x2500
+    $segmentos = $script:larguraColunasLog | ForEach-Object { [string]$traco * ($_ + 2) }
+    $linha = "  " + $esq + ($segmentos -join $meio) + $dir
+    if ($script:corSuportada) { return "$($script:ansiCinza)$linha$($script:ansiReset)" }
+    return $linha
+}
+
+function Format-LinhaTabelaLog {
     param(
-        [string[]]$NmapArgs,
-        [string]$PastaResultados,
-        [string]$RotuloLog
+        [string]$Hora,
+        [string]$Rede,
+        [string]$CorRede,
+        [string]$Fase,
+        [string]$Percentual = "",
+        [string]$Eta = "",
+        [string]$Status,
+        [string]$CorStatus,
+        [switch]$Cabecalho
     )
-    # Roda o nmap em segundo plano com Start-Process, redirecionando stdout/stderr
-    # nativamente (SEM passar por cmd.exe - descoberto em auditoria que empacotar o
-    # comando inteiro como uma unica string e mandar pro cmd.exe /c e fragil: o proprio
-    # PowerShell re-aplica suas regras de citacao por cima da string ja citada, quebrando
-    # o parsing quando ha varios caminhos com espaco - ex: pasta "Matheus Coelho"). Ao
-    # invocar o nmap.exe diretamente, cada argumento do array precisa ser citado
-    # manualmente quando contem espaco, porque Start-Process -ArgumentList NAO cita
-    # elementos automaticamente (diferente do operador "&" com splatting).
-    $outPath = Join-Path $PastaResultados "$RotuloLog.progresso.log"
-    $errPath = Join-Path $PastaResultados "$RotuloLog.progresso.err.log"
-    $argsQuoted = $NmapArgs | ForEach-Object {
-        if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+
+    $w = $script:larguraColunasLog
+
+    if ($Cabecalho) {
+        # So o cabecalho fica centralizado nas colunas - as linhas de dados usam o
+        # alinhamento normal (esquerda/direita), que fica mais facil de ler em log.
+        $horaF   = Format-TextoCentralizado $Hora $w[0]
+        $redeF   = Format-TextoCentralizado $Rede $w[1]
+        $faseF   = Format-TextoCentralizado $Fase $w[2]
+        $pctF    = Format-TextoCentralizado $Percentual $w[3]
+        $etaF    = Format-TextoCentralizado $Eta $w[4]
+        $statusF = Format-TextoCentralizado $Status $w[5]
+    } else {
+        # Hora, rede, % e ETA ficam centralizadas tambem nas linhas de dados (nao so
+        # no cabecalho); fase/status continuam alinhadas a esquerda, que fica mais
+        # facil de ler textos mais longos e variados.
+        $horaF   = Format-TextoCentralizado $Hora $w[0]
+        $redeF   = Format-TextoCentralizado $Rede $w[1]
+        # O traco "-" (placeholder de fase ainda nao definida) fica centralizado pra
+        # ficar padronizado visualmente; valores reais continuam alinhados a esquerda.
+        $faseF   = if ($Fase -eq "-") { Format-TextoCentralizado $Fase $w[2] } else { (Format-TextoTruncado $Fase $w[2]).PadRight($w[2]) }
+        $pctF    = Format-TextoCentralizado $Percentual $w[3]
+        $etaF    = Format-TextoCentralizado $Eta $w[4]
+        $statusF = (Format-TextoTruncado $Status $w[5]).PadRight($w[5])
     }
 
-    $cronometro = [Diagnostics.Stopwatch]::StartNew()
-    $processo = Start-Process -FilePath $script:nmapExe -ArgumentList $argsQuoted `
-        -RedirectStandardOutput $outPath -RedirectStandardError $errPath -PassThru -NoNewWindow
+    $pipe = [char]0x2502
+    if (-not $script:corSuportada) {
+        return "  $pipe $horaF $pipe $redeF $pipe $faseF $pipe $pctF $pipe $etaF $pipe $statusF $pipe"
+    }
 
-    # Captura tanto o nome da fase atual (ex: "SYN Stealth Scan", "Service scan", "NSE")
-    # quanto o percentual e o tempo restante estimado (ETC) que o proprio nmap recalcula
-    # dinamicamente a cada atualizacao, conforme a velocidade real do scan naquele momento.
-    $regexFase = '^(.+?)\s+Timing:\s+About\s+(\d+(?:\.\d+)?)%\s+done(?:;\s*ETC:\s*(\S+)\s*\(([^)]+)\s*remaining\))?'
-    $ultimoStatus = "iniciando..."
+    $p = "$($script:ansiCinza)$pipe$($script:ansiReset)"
+    return "  $p $($script:ansiCinza)$horaF$($script:ansiReset) $p $CorRede$redeF$($script:ansiReset) $p $($script:ansiBranco)$faseF$($script:ansiReset) $p $($script:ansiBranco)$pctF$($script:ansiReset) $p $($script:ansiCinza)$etaF$($script:ansiReset) $p $CorStatus$statusF$($script:ansiReset) $p"
+}
 
-    while (-not $processo.HasExited) {
-        Start-Sleep -Milliseconds 1000
-        if (Test-Path $outPath) {
-            $linhaFase = Get-Content $outPath -Tail 20 -ErrorAction SilentlyContinue |
-                Where-Object { $_ -match $regexFase } | Select-Object -Last 1
-            if ($linhaFase -and $linhaFase -match $regexFase) {
-                $fase = $Matches[1]
-                $percentual = [double]$Matches[2]
-                $restante = if ($Matches[4]) { $Matches[4] } else { "calculando..." }
-                $ultimoStatus = "{0}: {1:0.0}% concluido, tempo restante estimado: {2}" -f $fase, $percentual, $restante
+function Write-LinhaLogParalelo {
+    # Escreve uma linha do log. Se $LinhaExistente for informado (linha "viva" de uma
+    # fase ainda em andamento), reescreve por cima daquela linha em vez de criar uma
+    # nova - da a impressao de uma unica linha atualizando em tempo real. So cria
+    # linha nova quando $LinhaExistente e $null (primeira leitura de uma fase, ou
+    # console sem suporte a ANSI, onde reposicionar cursor nao e confiavel).
+    param(
+        [string]$Texto,
+        [Nullable[int]]$LinhaExistente = $null
+    )
+
+    if (-not $script:corSuportada) {
+        Write-Host $Texto
+        return $null
+    }
+
+    if ($null -ne $LinhaExistente) {
+        try {
+            $linhaFinal = [Console]::CursorTop
+            [Console]::SetCursorPosition(0, $LinhaExistente)
+            Write-Host -NoNewline "$($script:ansiEsc)[2K$Texto"
+            [Console]::SetCursorPosition(0, $linhaFinal)
+            return $LinhaExistente
+        } catch {
+            # Buffer do console menor que o esperado ou posicao invalida - segue
+            # criando uma linha nova, sem travar a execucao por causa disso.
+        }
+    }
+
+    $linha = [Console]::CursorTop
+    Write-Host $Texto
+    return $linha
+}
+
+function Invoke-NmapsComLogParalelo {
+    param(
+        [string[]]$Faixas,
+        [string]$PastaResultados,
+        [string]$Timestamp
+    )
+    # Roda um nmap por faixa de rede simultaneamente (Start-Process nao bloqueia) e
+    # registra o progresso como um LOG de tabela. Enquanto uma fase esta em andamento,
+    # a linha dela e reescrita no lugar (%/ETA atualizando em tempo real); quando a
+    # fase muda ou a rede termina, aquela linha fica congelada com o resultado final e
+    # uma linha nova e permanente comeca para a proxima fase - continua dando pra
+    # rolar pra tras e ver o historico completo de cada etapa que ja fechou.
+    $tarefas = foreach ($i in 0..($Faixas.Count - 1)) {
+        $faixa = $Faixas[$i]
+        $faixaSlug = ($faixa -replace '[/:]', '_')
+        $xmlPath = Join-Path $PastaResultados "scan_${faixaSlug}_$Timestamp.xml"
+        $outPath = Join-Path $PastaResultados "scan_${faixaSlug}_$Timestamp.progresso.log"
+        $errPath = Join-Path $PastaResultados "scan_${faixaSlug}_$Timestamp.progresso.err.log"
+        $nmapArgs = @('-O', '-sV', '--osscan-guess', '--stats-every', '3s', '-oX', $xmlPath, $faixa)
+        $argsQuoted = $nmapArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }
+
+        $processo = Start-Process -FilePath $script:nmapExe -ArgumentList $argsQuoted `
+            -RedirectStandardOutput $outPath -RedirectStandardError $errPath -PassThru -NoNewWindow
+
+        [PSCustomObject]@{
+            Faixa               = $faixa
+            Cor                 = $script:paletaCoresRede[$i % $script:paletaCoresRede.Count]
+            XmlPath             = $xmlPath
+            OutPath             = $outPath
+            ErrPath             = $errPath
+            Processo            = $processo
+            Cronometro          = [Diagnostics.Stopwatch]::StartNew()
+            Concluido           = $false
+            FaseLogada          = ""
+            PercentualLogado    = -1.0
+            EtaLogado           = "-"
+            LinhaViva           = $null
+        }
+    }
+
+    $cronometroGeral = [Diagnostics.Stopwatch]::StartNew()
+    # Alem da fase, tambem captura o ETC (tempo restante estimado) que o proprio nmap
+    # recalcula a cada atualizacao, para exibir um ETA por rede.
+    $regexFase = '^(.+?)\s+Timing:\s+About\s+(\d+(?:\.\d+)?)%\s+done(?:;\s*ETC:\s*\S+\s*\(([^)]+)\s*remaining\))?'
+
+    Write-Host ""
+    Write-Host (Format-BordaTabela -Tipo Topo)
+    Write-Host (Format-LinhaTabelaLog -Hora "hora" -Rede "rede" -CorRede $script:ansiCinza -Fase "fase" -Percentual "%" -Eta "eta" -Status "status" -CorStatus $script:ansiCinza -Cabecalho)
+    Write-Host (Format-BordaTabela -Tipo Meio)
+    foreach ($t in $tarefas) {
+        $linha = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "0.0%" -Eta "-" -Status "iniciado" -CorStatus $script:ansiCiano
+        $t.LinhaViva = Write-LinhaLogParalelo -Texto $linha
+    }
+
+    while ($tarefas | Where-Object { -not $_.Concluido }) {
+        Start-Sleep -Milliseconds 300
+        foreach ($t in $tarefas) {
+            if ($t.Concluido) { continue }
+
+            if ($t.Processo.HasExited) {
+                $t.Concluido = $true
+                $t.Cronometro.Stop()
+                $ok = ($t.Processo.ExitCode -eq 0)
+                $status = if ($ok) { "concluido em $(Format-Decorrido $t.Cronometro.Elapsed)" } else { "erro (codigo $($t.Processo.ExitCode))" }
+                $corStatus = if ($ok) { $script:ansiVerde } else { $script:ansiVermelho }
+                $linha = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "100.0%" -Eta "-" -Status $status -CorStatus $corStatus
+                # Congela a linha da ultima fase em andamento virando a linha final,
+                # em vez de abrir mais uma linha nova so pra dizer "concluido".
+                Write-LinhaLogParalelo -Texto $linha -LinhaExistente $t.LinhaViva | Out-Null
+                continue
+            }
+
+            $linhaJaAtualizada = $false
+
+            if (Test-Path $t.OutPath) {
+                $linhaFase = Get-Content $t.OutPath -Tail 20 -ErrorAction SilentlyContinue |
+                    Where-Object { $_ -match $regexFase } | Select-Object -Last 1
+                if ($linhaFase -and $linhaFase -match $regexFase) {
+                    $fase = $Matches[1]
+                    $percentual = [double]$Matches[2]
+                    $eta = if ($Matches[3]) { $Matches[3] } else { "calculando" }
+
+                    if ($fase -ne $t.FaseLogada) {
+                        # Fase nova: congela a linha da fase anterior (se existia) como
+                        # concluida, e abre uma linha nova e propria para a fase atual.
+                        if ($t.FaseLogada -and $null -ne $t.LinhaViva) {
+                            $linhaAntiga = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase $t.FaseLogada -Percentual "100.0%" -Eta "-" -Status "concluido" -CorStatus $script:ansiVerde
+                            Write-LinhaLogParalelo -Texto $linhaAntiga -LinhaExistente $t.LinhaViva | Out-Null
+                        }
+
+                        $t.FaseLogada = $fase
+                        $t.PercentualLogado = $percentual
+                        $t.EtaLogado = $eta
+                        $linhaNova = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase $fase -Percentual ("{0:0.0}%" -f $percentual) -Eta $eta -Status "iniciado" -CorStatus $script:ansiCiano
+                        $t.LinhaViva = Write-LinhaLogParalelo -Texto $linhaNova
+                        $linhaJaAtualizada = $true
+                    } else {
+                        $t.PercentualLogado = $percentual
+                        $t.EtaLogado = $eta
+                    }
+                }
+            }
+
+            # Batimento: mesmo sem leitura nova do nmap (que so atualiza a cada ~3s),
+            # reescreve a linha viva a cada volta do loop (~300ms) so pra manter a
+            # coluna "hora" andando feito um cronometro de verdade, em vez de travada
+            # esperando a proxima leitura de percentual.
+            if (-not $linhaJaAtualizada -and $t.FaseLogada -and $null -ne $t.LinhaViva) {
+                $linha = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase $t.FaseLogada -Percentual ("{0:0.0}%" -f $t.PercentualLogado) -Eta $t.EtaLogado -Status "em andamento" -CorStatus $script:ansiAmarelo
+                $t.LinhaViva = Write-LinhaLogParalelo -Texto $linha -LinhaExistente $t.LinhaViva
+            } elseif (-not $linhaJaAtualizada -and -not $t.FaseLogada -and $null -ne $t.LinhaViva) {
+                # Ainda na fase "-" inicial (nenhuma fase do nmap detectada ainda).
+                $linha = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "0.0%" -Eta "-" -Status "iniciado" -CorStatus $script:ansiCiano
+                $t.LinhaViva = Write-LinhaLogParalelo -Texto $linha -LinhaExistente $t.LinhaViva
             }
         }
-        $textoLinha = "  [decorrido {0}] {1}" -f (Format-Decorrido $cronometro.Elapsed), $ultimoStatus
-        Write-Host -NoNewline ("`r" + $textoLinha.PadRight(120))
     }
 
-    $cronometro.Stop()
-    Write-Host ("`r" + "  Concluido em $(Format-Decorrido $cronometro.Elapsed).".PadRight(110))
+    Write-Host (Format-BordaTabela -Tipo Base)
 
-    if ($processo.ExitCode -ne 0) {
-        $erroTexto = if (Test-Path $errPath) { (Get-Content $errPath -Raw) } else { "" }
-        Write-Host "  Aviso: nmap terminou com codigo $($processo.ExitCode). $erroTexto" -ForegroundColor Yellow
+    foreach ($t in $tarefas) {
+        if ($t.Processo.ExitCode -ne 0) {
+            $erroTexto = if (Test-Path $t.ErrPath) { (Get-Content $t.ErrPath -Raw) } else { "" }
+            Write-Host "  Aviso: nmap para $($t.Faixa) terminou com codigo $($t.Processo.ExitCode). $erroTexto" -ForegroundColor Yellow
+        }
+        Remove-Item $t.OutPath, $t.ErrPath -Force -ErrorAction SilentlyContinue
     }
 
-    Remove-Item $outPath, $errPath -Force -ErrorAction SilentlyContinue
-    return $cronometro.Elapsed
+    return $tarefas
 }
 
 function ConvertTo-CIDR([string]$ip, [int]$prefixLength) {
@@ -858,7 +1144,7 @@ try {
     if (-not (Test-Administrador)) {
         Write-Host "Solicitando elevacao de administrador (aceite o prompt do Windows)..." -ForegroundColor Yellow
         $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
-        if ($Rede) { $argList += @('-Rede', "`"$Rede`"") }
+        if ($Rede) { $argList += @('-Rede', "`"$($Rede -join ',')`"") }
         if ($Forcar) { $argList += '-Forcar' }
 
         try {
@@ -867,6 +1153,18 @@ try {
             throw "Nao foi possivel elevar para Administrador (voce recusou o prompt do UAC, ou nao tem permissao de admin nesta conta). Detalhe: $($_.Exception.Message)"
         }
         exit
+    }
+
+    # Ajusta a codepage do console para UTF-8 (65001). Sem isso, o console do Windows
+    # continua interpretando a saida com a codepage antiga (ex: 850/1252) mesmo que o
+    # .NET mande bytes UTF-8, e os caracteres de bloco/spinner da barra de progresso
+    # aparecem como retangulos vazios ("tofu") em vez do simbolo correto.
+    try {
+        chcp.com 65001 | Out-Null
+        [Console]::OutputEncoding = [Text.Encoding]::UTF8
+    } catch {
+        # Se falhar (ex: console nao suporta), a barra de progresso cai para o modo
+        # texto simples automaticamente via $script:corSuportada.
     }
 
     # --- Localiza o nmap: PATH -> pasta "nmap" ao lado do script (pen drive) -> instala automaticamente ---
@@ -890,12 +1188,15 @@ try {
     }
 
     $timestamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
+    $numeroRegistro = Get-ProximoNumeroRegistro
+    $nomeComputador = Get-NomeComputadorCompleto
+    Write-Host "Registro N. $numeroRegistro  -  Computador: $nomeComputador" -ForegroundColor Cyan
 
     # --- Determina a(s) faixa(s) a escanear ---
     $faixas = @()
     if ($Rede) {
         $faixas = @($Rede)
-        Write-Host "Usando faixa forcada: $Rede" -ForegroundColor Cyan
+        Write-Host "Usando faixa(s) forcada(s): $($Rede -join ', ')" -ForegroundColor Cyan
     } else {
         $redesDetectadas = Wait-RedesLocaisAtivas
         if (-not $redesDetectadas -or @($redesDetectadas).Count -eq 0) {
@@ -903,7 +1204,7 @@ try {
         }
 
         Write-Host "Rede(s) detectada(s):" -ForegroundColor Cyan
-        $redesDetectadas | ForEach-Object { Write-Host "  - $($_.Adaptador): $($_.IP) -> $($_.CIDR)" -ForegroundColor Cyan }
+        $redesDetectadas | ForEach-Object { Write-Host "  - $($_.Adaptador): $($_.IP) -> $($_.CIDR)" -ForegroundColor White }
 
         $faixas = @($redesDetectadas.CIDR | Select-Object -Unique)
 
@@ -948,18 +1249,21 @@ try {
 
     $linhasTotais = @()
 
-    foreach ($faixa in $faixas) {
-        $faixaSlug = ($faixa -replace '[/:]', '_')
-        $xmlPath = Join-Path $pastaResultados "scan_${faixaSlug}_$timestamp.xml"
+    Write-Host ""
+    if ($faixas.Count -gt 1) {
+        Write-Host "Escaneando $($faixas.Count) redes em paralelo ... isso pode levar alguns minutos." -ForegroundColor Cyan
+    } else {
+        Write-Host "Escaneando $($faixas[0]) ... isso pode levar alguns minutos." -ForegroundColor Cyan
+    }
 
-        Write-Host ""
-        Write-Host "Escaneando $faixa ... isso pode levar alguns minutos." -ForegroundColor Cyan
+    # Dispara um nmap por faixa ao mesmo tempo (em vez de rede por rede em sequencia) e
+    # desenha um painel com uma linha de progresso por rede, cada uma virando verde
+    # assim que aquela faixa termina - as demais continuam rodando normalmente.
+    $tarefasScan = Invoke-NmapsComLogParalelo -Faixas $faixas -PastaResultados $pastaResultados -Timestamp $timestamp
 
-        # --stats-every: faz o nmap reportar % concluido/ETC periodicamente; a funcao abaixo
-        # le isso e desenha uma unica linha viva no console (atualizada no lugar, sem
-        # quebra de linha a cada atualizacao), com o tempo decorrido daquela faixa.
-        $nmapArgs = @('-O', '-sV', '--osscan-guess', '--stats-every', '3s', '-oX', $xmlPath, $faixa)
-        Invoke-NmapComBarraDeProgresso -NmapArgs $nmapArgs -PastaResultados $pastaResultados -RotuloLog "scan_${faixaSlug}_$timestamp" | Out-Null
+    foreach ($tarefa in $tarefasScan) {
+        $faixa = $tarefa.Faixa
+        $xmlPath = $tarefa.XmlPath
 
         if (-not (Test-Path $xmlPath)) {
             Write-Host "O Nmap nao gerou saida para $faixa. Pulando." -ForegroundColor Red
@@ -1008,6 +1312,8 @@ try {
                 SO_Estimado             = $so
                 PortasAbertas           = ($portasAbertas -join "; ")
                 DataScan                = $timestamp
+                NumeroRegistro          = $numeroRegistro
+                ComputadorOrigem        = $nomeComputador
             }
         }
     }
@@ -1020,8 +1326,8 @@ try {
     $cronometroTotal.Stop()
     $tempoTotalTexto = Format-Decorrido $cronometroTotal.Elapsed
 
-    $resumoPath = New-RelatorioResumo -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto
-    $htmlPath = New-RelatorioHtml -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto
+    $resumoPath = New-RelatorioResumo -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto -NumeroRegistro $numeroRegistro -Computador $nomeComputador
+    $htmlPath = New-RelatorioHtml -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto -NumeroRegistro $numeroRegistro -Computador $nomeComputador
 
     Write-Host ""
     Write-Host "Concluido em $tempoTotalTexto! $($linhasTotais.Count) dispositivos ativos encontrados no total." -ForegroundColor Green

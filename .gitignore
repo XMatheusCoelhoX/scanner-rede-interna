@@ -5,6 +5,9 @@ resultados/
 # Memoria de redes ja escaneadas - especifica do ambiente de cada execucao.
 redes_conhecidas.json
 
+# Contador do numero de registro dos scans - especifico do ambiente de cada execucao.
+registro_scans.json
+
 # Copia local do Nmap (opcional, usada so para evitar o download automatico).
 # Nao redistribuir o binario de terceiros junto do repositorio.
 nmap/
