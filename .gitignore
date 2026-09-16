@@ -1,0 +1,19 @@
+# Resultados de scan - dados reais da rede de quem executa (IPs, MACs, topologia).
+# NUNCA deve ir para o repositorio.
+resultados/
+
+# Memoria de redes ja escaneadas - especifica do ambiente de cada execucao.
+redes_conhecidas.json
+
+# Copia local do Nmap (opcional, usada so para evitar o download automatico).
+# Nao redistribuir o binario de terceiros junto do repositorio.
+nmap/
+
+# Arquivos e pastas comuns do Windows.
+Thumbs.db
+desktop.ini
+*.log
+
+# Editor/IDE
+.vscode/
+*.swp
