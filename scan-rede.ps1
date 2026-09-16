@@ -54,6 +54,22 @@ function Get-CaminhoRedesConhecidas {
     return Join-Path $PSScriptRoot "redes_conhecidas.json"
 }
 
+function Invoke-NmapCapturado {
+    param([string[]]$NmapArgs)
+    # Roda o nmap capturando stdout+stderr juntos, SEM deixar linhas de aviso do
+    # proprio nmap (que vao para stderr, ex: "WARNING: No targets were specified")
+    # virarem erro fatal do PowerShell. Com $ErrorActionPreference = "Stop" no
+    # escopo do script, qualquer linha em stderr de um comando externo com "2>&1"
+    # normalmente vira uma excecao - isso e revertido so aqui dentro, localmente.
+    $prefAnterior = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $script:nmapExe @NmapArgs 2>&1
+    } finally {
+        $ErrorActionPreference = $prefAnterior
+    }
+}
+
 function Get-RedesConhecidas {
     $caminho = Get-CaminhoRedesConhecidas
     if (-not (Test-Path $caminho)) { return @() }
@@ -229,7 +245,9 @@ function Confirm-Impressoras {
     $logPath = Join-Path $PastaResultados "confirmacao_impressoras_$Timestamp.txt"
 
     try {
-        $saida = & $script:nmapExe -p 9100,631,515 @ips 2>&1
+        # -Pn: esses hosts ja foram confirmados "up" no scan principal, entao pula a
+        # descoberta de host de novo - evita falso negativo se o dispositivo bloquear ping.
+        $saida = Invoke-NmapCapturado -NmapArgs (@('-Pn', '-p', '9100,631,515') + $ips)
         $saida | Out-File -FilePath $logPath -Encoding UTF8
     } catch {
         Write-Host "  Nao foi possivel confirmar impressoras: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -262,7 +280,7 @@ function Resolve-NomeInterfaceNmap([string]$ipAlvo) {
     # (ex: "Ethernet") no parametro -e - ele usa nomes proprios tipo "eth0", "eth1". Essa
     # funcao acha o nome correto casando pelo IP, usando a saida de "nmap --iflist".
     try {
-        $saida = & $script:nmapExe --iflist 2>&1
+        $saida = Invoke-NmapCapturado -NmapArgs @('--iflist')
     } catch {
         return $null
     }
@@ -292,8 +310,10 @@ function Find-DhcpNaoAutorizado([string]$nomeInterface, [string]$ip, [string]$pa
     try {
         # --script-timeout limita o tempo maximo dessa sondagem (evita ficar preso pra sempre
         # esperando resposta de broadcast que pode nunca chegar); a saida e mostrada ao vivo
-        # no console (Tee-Object so espelha pro arquivo, nao suprime mais a tela).
-        & $script:nmapExe --script broadcast-dhcp-discover --script-timeout 20s -e $devNmap 2>&1 | Tee-Object -FilePath $logPath
+        # no console (Tee-Object so espelha pro arquivo, nao suprime mais a tela). Usa
+        # Invoke-NmapCapturado para nao deixar avisos do nmap em stderr (ex: "WARNING: No
+        # targets were specified" - normal para um script de broadcast) virarem erro fatal.
+        Invoke-NmapCapturado -NmapArgs @('--script', 'broadcast-dhcp-discover', '--script-timeout', '20s', '-e', $devNmap) | Tee-Object -FilePath $logPath
     } catch {
         Write-Host "  Nao foi possivel rodar a checagem de DHCP em '$nomeInterface': $($_.Exception.Message)" -ForegroundColor Yellow
         return
@@ -326,7 +346,8 @@ function New-RelatorioResumo {
         [array]$Faixas,
         [array]$AlertasDhcp,
         [string]$Timestamp,
-        [string]$PastaResultados
+        [string]$PastaResultados,
+        [string]$TempoTotal = ""
     )
 
     $linhasTexto = New-Object System.Collections.Generic.List[string]
@@ -336,6 +357,7 @@ function New-RelatorioResumo {
     & $add "  RESUMO DO SCAN DE REDE"
     & $add "========================================================"
     & $add "Data/Hora: $(Get-Date -Date ([datetime]::ParseExact($Timestamp,'yyyy-MM-dd_HHmmss',$null)) -Format 'dd/MM/yyyy HH:mm:ss')"
+    if ($TempoTotal) { & $add "Tempo total da execucao (inicio ao fim): $TempoTotal" }
     & $add ""
     $Faixas = @($Faixas)
     $Linhas = @($Linhas)
@@ -427,7 +449,8 @@ function New-RelatorioHtml {
         [array]$Faixas,
         [array]$AlertasDhcp,
         [string]$Timestamp,
-        [string]$PastaResultados
+        [string]$PastaResultados,
+        [string]$TempoTotal = ""
     )
 
     $Faixas = @($Faixas)
@@ -614,6 +637,7 @@ function New-RelatorioHtml {
       <span class="pill">Gerado em $dataFormatada</span>
       <span class="pill">$($Faixas.Count) rede(s) escaneada(s)</span>
       <span class="pill">$($Faixas -join ', ')</span>
+      $(if ($TempoTotal) { "<span class='pill'>Duracao total: $TempoTotal</span>" })
     </div>
   </div>
 
@@ -680,6 +704,71 @@ function New-RelatorioHtml {
     $htmlPath = Join-Path $PastaResultados "relatorio_$Timestamp.html"
     $html | Out-File -FilePath $htmlPath -Encoding UTF8
     return $htmlPath
+}
+
+function Format-Decorrido([TimeSpan]$tempo) {
+    if ($tempo.TotalHours -ge 1) {
+        return "{0:00}:{1:00}:{2:00}" -f [int]$tempo.TotalHours, $tempo.Minutes, $tempo.Seconds
+    }
+    return "{0:00}:{1:00}" -f $tempo.Minutes, $tempo.Seconds
+}
+
+function Invoke-NmapComBarraDeProgresso {
+    param(
+        [string[]]$NmapArgs,
+        [string]$PastaResultados,
+        [string]$RotuloLog
+    )
+    # Roda o nmap em segundo plano com Start-Process, redirecionando stdout/stderr
+    # nativamente (SEM passar por cmd.exe - descoberto em auditoria que empacotar o
+    # comando inteiro como uma unica string e mandar pro cmd.exe /c e fragil: o proprio
+    # PowerShell re-aplica suas regras de citacao por cima da string ja citada, quebrando
+    # o parsing quando ha varios caminhos com espaco - ex: pasta "Matheus Coelho"). Ao
+    # invocar o nmap.exe diretamente, cada argumento do array precisa ser citado
+    # manualmente quando contem espaco, porque Start-Process -ArgumentList NAO cita
+    # elementos automaticamente (diferente do operador "&" com splatting).
+    $outPath = Join-Path $PastaResultados "$RotuloLog.progresso.log"
+    $errPath = Join-Path $PastaResultados "$RotuloLog.progresso.err.log"
+    $argsQuoted = $NmapArgs | ForEach-Object {
+        if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+    }
+
+    $cronometro = [Diagnostics.Stopwatch]::StartNew()
+    $processo = Start-Process -FilePath $script:nmapExe -ArgumentList $argsQuoted `
+        -RedirectStandardOutput $outPath -RedirectStandardError $errPath -PassThru -NoNewWindow
+
+    # Captura tanto o nome da fase atual (ex: "SYN Stealth Scan", "Service scan", "NSE")
+    # quanto o percentual e o tempo restante estimado (ETC) que o proprio nmap recalcula
+    # dinamicamente a cada atualizacao, conforme a velocidade real do scan naquele momento.
+    $regexFase = '^(.+?)\s+Timing:\s+About\s+(\d+(?:\.\d+)?)%\s+done(?:;\s*ETC:\s*(\S+)\s*\(([^)]+)\s*remaining\))?'
+    $ultimoStatus = "iniciando..."
+
+    while (-not $processo.HasExited) {
+        Start-Sleep -Milliseconds 1000
+        if (Test-Path $outPath) {
+            $linhaFase = Get-Content $outPath -Tail 20 -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match $regexFase } | Select-Object -Last 1
+            if ($linhaFase -and $linhaFase -match $regexFase) {
+                $fase = $Matches[1]
+                $percentual = [double]$Matches[2]
+                $restante = if ($Matches[4]) { $Matches[4] } else { "calculando..." }
+                $ultimoStatus = "{0}: {1:0.0}% concluido, tempo restante estimado: {2}" -f $fase, $percentual, $restante
+            }
+        }
+        $textoLinha = "  [decorrido {0}] {1}" -f (Format-Decorrido $cronometro.Elapsed), $ultimoStatus
+        Write-Host -NoNewline ("`r" + $textoLinha.PadRight(120))
+    }
+
+    $cronometro.Stop()
+    Write-Host ("`r" + "  Concluido em $(Format-Decorrido $cronometro.Elapsed).".PadRight(110))
+
+    if ($processo.ExitCode -ne 0) {
+        $erroTexto = if (Test-Path $errPath) { (Get-Content $errPath -Raw) } else { "" }
+        Write-Host "  Aviso: nmap terminou com codigo $($processo.ExitCode). $erroTexto" -ForegroundColor Yellow
+    }
+
+    Remove-Item $outPath, $errPath -Force -ErrorAction SilentlyContinue
+    return $cronometro.Elapsed
 }
 
 function ConvertTo-CIDR([string]$ip, [int]$prefixLength) {
@@ -760,6 +849,7 @@ function Get-RedesLocaisAtivas {
 }
 
 # ============================== EXECUCAO ==============================
+$cronometroTotal = [Diagnostics.Stopwatch]::StartNew()
 try {
     $ErrorActionPreference = "Stop"
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13 -bor [Net.ServicePointManager]::SecurityProtocol
@@ -864,12 +954,12 @@ try {
 
         Write-Host ""
         Write-Host "Escaneando $faixa ... isso pode levar alguns minutos." -ForegroundColor Cyan
-        Write-Host "(o Nmap vai imprimir uma linha de progresso a cada 10s - 'Stats: ... % done; ETC: ...')" -ForegroundColor DarkGray
 
-        # --stats-every: imprime uma linha de progresso ao vivo periodicamente (percentual,
-        # tempo decorrido, estimativa de termino) para acompanhar um scan longo em andamento.
-        $nmapArgs = @('-O', '-sV', '--osscan-guess', '--stats-every', '10s', '-oX', $xmlPath, $faixa)
-        & $nmapExe @nmapArgs
+        # --stats-every: faz o nmap reportar % concluido/ETC periodicamente; a funcao abaixo
+        # le isso e desenha uma unica linha viva no console (atualizada no lugar, sem
+        # quebra de linha a cada atualizacao), com o tempo decorrido daquela faixa.
+        $nmapArgs = @('-O', '-sV', '--osscan-guess', '--stats-every', '3s', '-oX', $xmlPath, $faixa)
+        Invoke-NmapComBarraDeProgresso -NmapArgs $nmapArgs -PastaResultados $pastaResultados -RotuloLog "scan_${faixaSlug}_$timestamp" | Out-Null
 
         if (-not (Test-Path $xmlPath)) {
             Write-Host "O Nmap nao gerou saida para $faixa. Pulando." -ForegroundColor Red
@@ -927,19 +1017,23 @@ try {
     $csvPath = Join-Path $pastaResultados "inventario_$timestamp.csv"
     $linhasTotais | Sort-Object Rede, { [version]($_.IP -replace '^\D+', '') } -ErrorAction SilentlyContinue | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
-    $resumoPath = New-RelatorioResumo -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados
-    $htmlPath = New-RelatorioHtml -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados
+    $cronometroTotal.Stop()
+    $tempoTotalTexto = Format-Decorrido $cronometroTotal.Elapsed
+
+    $resumoPath = New-RelatorioResumo -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto
+    $htmlPath = New-RelatorioHtml -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto
 
     Write-Host ""
-    Write-Host "Concluido! $($linhasTotais.Count) dispositivos ativos encontrados no total." -ForegroundColor Green
+    Write-Host "Concluido em $tempoTotalTexto! $($linhasTotais.Count) dispositivos ativos encontrados no total." -ForegroundColor Green
     Write-Host "CSV salvo em: $csvPath" -ForegroundColor Green
     Write-Host "Resumo salvo em: $resumoPath" -ForegroundColor Green
     Write-Host "Relatorio para apresentacao (HTML) salvo em: $htmlPath" -ForegroundColor Green
 
     Aguardar-Saida
 } catch {
+    $cronometroTotal.Stop()
     Write-Host ""
-    Write-Host "ERRO: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "ERRO apos $(Format-Decorrido $cronometroTotal.Elapsed) de execucao: $($_.Exception.Message)" -ForegroundColor Red
     Aguardar-Saida
     exit 1
 }

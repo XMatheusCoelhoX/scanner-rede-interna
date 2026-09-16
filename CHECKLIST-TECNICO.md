@@ -45,10 +45,10 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
    - Se **todas** já são conhecidas e `-Forcar` não foi passado → avisa e **encerra sem escanear**
    - Se há rede(s) **nova(s)** → prossegue só com as novas (ou com todas, se `-Forcar`)
 8. [ ] Para cada adaptador físico envolvido: roda a checagem de **DHCP não autorizado** (resolve o nome de interface que o Nmap reconhece via `nmap --iflist`, casando pelo IP; roda `nmap --script broadcast-dhcp-discover --script-timeout 20s`, com saída ao vivo no console e limite de 20s pra não travar esperando resposta que não vem)
-9. [ ] Para cada faixa de rede a escanear: roda `nmap -O -sV --osscan-guess --stats-every 10s -oX <arquivo>.xml <faixa>` (o `--stats-every` imprime progresso ao vivo a cada 10s durante o scan)
+9. [ ] Para cada faixa de rede a escanear: roda `nmap -O -sV --osscan-guess --stats-every 3s -oX <arquivo>.xml <faixa>` em segundo plano via `Start-Process` (invocação direta do `nmap.exe`, sem passar por `cmd.exe`), com saída redirecionada para um arquivo temporário; enquanto o processo roda, o script exibe uma **barra de progresso de linha única** (atualizada com `\r`, sem quebra de linha) mostrando fase atual, % concluído e ETA, recalculados a cada segundo a partir do `--stats-every`
 10. [ ] Lê o XML gerado e monta uma linha por host ativo (`status=up`), extraindo IP, MAC, fabricante, hostname, portas abertas, SO estimado
 11. [ ] Classifica cada host em um **Tipo Provável** (roteador/switch, PC/servidor, fabricante de contrato, MAC aleatório, etc.) cruzando o fabricante do MAC com listas conhecidas + checagem bit a bit do MAC
-12. [ ] Roda uma **confirmação extra de impressoras** (`nmap -p 9100,631,515`) só nos hosts cujo fabricante é ambíguo (chip de rede genérico tipo Realtek)
+12. [ ] Roda uma **confirmação extra de impressoras** (`nmap -Pn -p 9100,631,515`) só nos hosts cujo fabricante é ambíguo (chip de rede genérico tipo Realtek) — o `-Pn` evita falso negativo em impressoras com ICMP/ping bloqueado
 13. [ ] Marca a(s) faixa(s) recém-escaneada(s) como "conhecida(s)" em `redes_conhecidas.json`
 14. [ ] Exporta o inventário completo em CSV
 15. [ ] Gera o **resumo em texto** (contagens, alertas, top fabricantes/SOs)
@@ -64,18 +64,21 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 | `Aguardar-Saida` | Mantém a janela do console aberta no fim da execução (sucesso ou erro) |
 | `Test-Administrador` | Verifica se o processo atual tem privilégio de administrador |
 | `Get-CaminhoRedesConhecidas` / `Get-RedesConhecidas` / `Save-RedeConhecida` | Leitura/escrita da "memória" de redes já escaneadas (`redes_conhecidas.json`) |
+| `Invoke-NmapCapturado` | Roda o Nmap capturando stdout+stderr juntos sem deixar avisos em stderr virarem erro fatal do PowerShell (ver seção 12) |
 | `Install-Nmap` | Baixa, valida assinatura digital, e instala o Nmap silenciosamente |
 | `Test-EquipamentoDeRede` | Verifica se o fabricante do MAC bate com marca conhecida de roteador/switch/AP |
 | `Test-MacLocalmenteAdministrado` | Checa o bit "locally administered" do MAC (identifica endereço aleatório/spoofed) |
 | `Get-TipoProvavel` | Classifica o tipo provável de dispositivo (roteador, PC, impressora, ODM, etc.) |
-| `Confirm-Impressoras` | Roda scan extra nas portas 9100/631/515 para confirmar impressoras suspeitas |
+| `Confirm-Impressoras` | Roda scan extra nas portas 9100/631/515 (com `-Pn`) para confirmar impressoras suspeitas |
 | `Resolve-NomeInterfaceNmap` | Descobre o nome de interface que o Nmap usa (`eth0`, `eth1`...) casando pelo IP, já que difere do nome do Windows |
 | `Find-DhcpNaoAutorizado` | Roda a sondagem de broadcast DHCP e alerta se houver mais de um servidor respondendo |
+| `New-RelatorioResumo` | Gera o resumo em texto (`resumo_<data>.txt`), incluindo o tempo total da execução |
+| `ConvertTo-TextoHtml` | Escapa caracteres especiais (`&`, `<`, `>`, `"`) para uso seguro dentro do HTML |
+| `New-RelatorioHtml` | Gera o relatório visual em HTML (`relatorio_<data>.html`), incluindo o tempo total da execução |
+| `Format-Decorrido` | Formata um `TimeSpan` como `mm:ss` ou `hh:mm:ss` para exibição |
+| `Invoke-NmapComBarraDeProgresso` | Roda o scan principal em segundo plano e desenha a barra de progresso de linha única no console (ver seção 12) |
 | `ConvertTo-CIDR` | Calcula o endereço de rede (CIDR) a partir de um IP + tamanho de prefixo |
 | `Wait-RedesLocaisAtivas` / `Get-RedesLocaisAtivas` | Detecção da(s) rede(s) local(is) ativa(s), com espera/retentativa para dar tempo ao DHCP |
-| `ConvertTo-TextoHtml` | Escapa caracteres especiais (`&`, `<`, `>`, `"`) para uso seguro dentro do HTML |
-| `New-RelatorioResumo` | Gera o resumo em texto (`resumo_<data>.txt`) |
-| `New-RelatorioHtml` | Gera o relatório visual em HTML (`relatorio_<data>.html`) |
 
 ---
 
@@ -89,8 +92,9 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 | `resultados\dhcp_check_<adaptador>_<data>.txt` | resultados\ | A cada checagem de DHCP | Saída bruta do script NSE `broadcast-dhcp-discover` |
 | `resultados\confirmacao_impressoras_<data>.txt` | resultados\ | Quando há suspeitos de impressora | Saída do scan focado nas portas 9100/631/515 |
 | `resultados\inventario_<data>.csv` | resultados\ | Ao final de cada execução | Inventário completo, uma linha por dispositivo — abre no Excel |
-| `resultados\resumo_<data>.txt` | resultados\ | Ao final de cada execução | Resumo agregado em texto simples |
+| `resultados\resumo_<data>.txt` | resultados\ | Ao final de cada execução | Resumo agregado em texto simples, incluindo tempo total da execução |
 | `resultados\relatorio_<data>.html` | resultados\ | Ao final de cada execução | Relatório visual, pronto para apresentação/impressão em PDF |
+| `resultados\<rotulo>.progresso.log` / `.progresso.err.log` | resultados\ | Temporário, durante o scan principal | stdout/stderr do Nmap redirecionados para leitura da barra de progresso — **apagados automaticamente** ao final de cada faixa escaneada (não ficam no disco depois) |
 
 ---
 
@@ -170,6 +174,29 @@ Ordem de avaliação (a primeira regra que bater, vale):
 - [ ] Conferir `resultados\relatorio_<data>.html` (visual) e `inventario_<data>.csv` (dados)
 - [ ] Guardar os arquivos de cada execução para comparar histórico depois
 - [ ] Investigar fisicamente qualquer linha marcada como equipamento de rede suspeito ou alerta de DHCP duplicado
+
+---
+
+## 12. Auditoria técnica (16/09/2026)
+
+Revisão linha a linha do script inteiro + testes reais contra o Nmap (incluindo contra o caminho real do projeto, com espaço e acento no diretório).
+
+### Bugs corrigidos
+
+- [x] **🔴 Crítica — falha silenciosa no scan principal.** `Invoke-NmapComBarraDeProgresso` originalmente montava o comando do Nmap como uma string única e mandava pro `cmd.exe /c`. O PowerShell reaplica suas próprias regras de citação por cima de uma string já citada manualmente, corrompendo o parsing sempre que havia mais de um caminho com espaço na linha de comando (ex: a própria pasta do projeto, `...\Matheus Coelho\...`). Resultado: o `cmd.exe` falhava (exit code 1) sem nenhum arquivo de log ou XML sendo criado, e o script seguia adiante achando que só não tinha achado nada (`"O Nmap nao gerou saida... Pulando."`) — um relatório final de "0 dispositivos" sem pista nenhuma da causa real.
+  - **Correção:** reescrita para invocar `nmap.exe` diretamente via `Start-Process` (sem `cmd.exe`), usando `-RedirectStandardOutput`/`-RedirectStandardError` nativos. Isso revelou um segundo problema: `Start-Process -ArgumentList` não cita automaticamente argumentos com espaço (diferente do operador `&` com splatting usado no resto do script) — o caminho do XML estava sendo cortado no primeiro espaço (`C:\Users\Matheus` em vez do caminho completo), e o Nmap reportava `Failed to open XML output file ... Acesso negado`. Corrigido citando manualmente cada elemento do array de argumentos antes de passar para `-ArgumentList`.
+  - **Verificação:** testado isoladamente contra `192.168.111.1` usando o caminho real da pasta `resultados\` do projeto (com espaço + "á"); confirmado XML gerado corretamente e barra de progresso funcionando ao vivo (fase, %, ETA dinâmico) do início ao fim.
+- [x] **🟡 Média — falso negativo em confirmação de impressora.** `Confirm-Impressoras` não usava `-Pn`, então uma impressora com ICMP/ping bloqueado seria erroneamente classificada como "PC provável" por não responder à redescoberta de host. Corrigido adicionando `-Pn` (os hosts já foram confirmados ativos no scan principal).
+
+### Verificado e confirmado correto
+- [x] Autoelevação via UAC já citava argumentos corretamente (confirmado por múltiplas execuções bem-sucedidas reais)
+- [x] `Resolve-NomeInterfaceNmap`, `Find-DhcpNaoAutorizado` e `Confirm-Impressoras` usam `Invoke-NmapCapturado` (operador `&` com splatting), que não tem o mesmo risco de citação do `Start-Process`
+- [x] Nenhum outro uso de `Start-Process` no script tem o padrão de risco encontrado no item crítico acima
+
+### Backlog identificado (não crítico, não corrigido nesta rodada)
+- [ ] Sem timeout de segurança geral para o processo do Nmap no scan principal — se travar por motivo externo (driver, rede), a barra de progresso rodaria indefinidamente até o processo terminar sozinho
+- [ ] `Aguardar-Saida` assume execução interativa (console real); impede automação totalmente não-interativa (ex: tarefa agendada) sem adicionar um parâmetro tipo `-SemPausa` no futuro
+- [ ] Checagem por fabricante literalmente `"Unknown"`/`"desconhecido"` em `Get-TipoProvavel` é código morto — o Nmap nunca emite esse texto, só omite o atributo quando não reconhece o OUI (já coberto pelo `-not $fabricante`). Inofensivo, mas redundante
 
 ---
 

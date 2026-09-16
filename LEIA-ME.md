@@ -69,11 +69,11 @@ Pra resolver isso **em qualquer computador**, sem hardcoded nada, o script:
 
 Se por algum motivo essa resolução falhar (formato de saída inesperado, versão muito diferente de Nmap/Npcap) o script **não trava** — ele avisa e pula só essa checagem específica, seguindo normalmente para o scan principal, que não depende dela.
 
-### Passo 6 — Execução do scan
+### Passo 6 — Execução do scan (com barra de progresso ao vivo)
 Para cada faixa detectada (ou forçada), roda:
 
 ```
-nmap -O -sV --osscan-guess --stats-every 10s -oX <arquivo>.xml <faixa>
+nmap -O -sV --osscan-guess --stats-every 3s -oX <arquivo>.xml <faixa>
 ```
 
 | Flag | O que faz |
@@ -81,8 +81,22 @@ nmap -O -sV --osscan-guess --stats-every 10s -oX <arquivo>.xml <faixa>
 | `-O` | Tenta identificar o sistema operacional de cada dispositivo |
 | `-sV` | Identifica versão de serviços rodando nas portas abertas |
 | `--osscan-guess` | Deixa o palpite de SO mais "flexível" quando não há 100% de certeza |
-| `--stats-every 10s` | Imprime uma linha de progresso ao vivo a cada 10 segundos (`Stats: ... % done; ETC: ...`) para acompanhar o andamento em tempo real num scan longo |
+| `--stats-every 3s` | Faz o Nmap recalcular e reportar percentual/ETA a cada 3 segundos |
 | `-oX` | Salva a saída bruta em formato XML (arquivo intermediário — o relatório final em HTML só é gerado depois que **todas** as faixas terminam de escanear) |
+
+O Nmap não roda direto no console — a função `Invoke-NmapComBarraDeProgresso` executa ele em segundo plano (via `Start-Process`, com a saída redirecionada para um arquivo temporário) e desenha **uma única linha viva no terminal**, atualizada no lugar (usando retorno de carro `\r`, sem quebrar linha a cada atualização), mostrando:
+
+```
+[decorrido 02:14] Service scan: 66,7% concluido, tempo restante estimado: 0:01:03
+```
+
+- **Tempo decorrido**: cronômetro daquela faixa específica, atualizado a cada segundo
+- **Fase atual**: qual etapa do Nmap está rodando (`SYN Stealth Scan`, `Service scan`, `NSE`, etc.)
+- **% concluído e tempo restante estimado**: recalculado pelo próprio Nmap a cada atualização — varia sozinho conforme a velocidade real do scan muda (fica mais rápido/lento dependendo de quantos hosts respondem, congestionamento da rede, etc.)
+
+Separadamente, também existe um cronômetro da **execução inteira** (do início ao fim — inclui checagem de DHCP, todas as faixas, confirmação de impressoras e geração dos relatórios), mostrado na mensagem final e salvo no resumo/HTML.
+
+> **Nota de auditoria (corrigido):** a primeira versão dessa barra de progresso tinha um bug de aspas que fazia o scan **falhar silenciosamente** (sem gerar erro nem XML) em qualquer caminho de pasta com espaço — que é exatamente o caso deste projeto (`...\Matheus Coelho\...`). Duas causas foram encontradas e corrigidas: (1) enviar o comando pronto como uma string única para `cmd.exe` fazia o PowerShell requotar por cima e quebrar o parsing; (2) depois de trocar para invocar o Nmap diretamente, descobriu-se que `Start-Process -ArgumentList` **não** coloca aspas automáticas em argumentos com espaço (diferente do operador `&` usado no resto do script) — corrigido citando manualmente cada argumento antes de passar. Testado e confirmado funcionando com o caminho real do projeto.
 
 ### Passo 7 — Geração do inventário (CSV)
 Lê o XML gerado e monta uma tabela com uma linha por dispositivo ativo encontrado:
@@ -117,7 +131,10 @@ Além do fabricante bruto, o script tenta adivinhar o **tipo** de cada dispositi
 | `(fabricante nao identificado)` | Nmap não achou esse prefixo de MAC na base de fabricantes (OUI raro ou desatualizado na base local) |
 | `Nao classificado` | Fabricante reconhecido, mas não bate com nenhuma das listas acima |
 
-**Confirmação automática de impressoras:** depois do scan principal, o script roda um scan extra e focado (`nmap -p 9100,631,515`) só nos hosts marcados como "possível impressora" pelo fabricante ambíguo, pra confirmar de verdade antes de você sair procurando uma impressora que na real é só um PC. Detalhes salvos em `resultados\confirmacao_impressoras_<data>.txt`.
+**Confirmação automática de impressoras:** depois do scan principal, o script roda um scan extra e focado (`nmap -Pn -p 9100,631,515`) só nos hosts marcados como "possível impressora" pelo fabricante ambíguo, pra confirmar de verdade antes de você sair procurando uma impressora que na real é só um PC. O `-Pn` pula a redescoberta de host (esses IPs já foram confirmados ativos no scan principal) — sem ele, uma impressora com ping/ICMP bloqueado seria incorretamente classificada como "PC provável" por não responder à sondagem de host. Detalhes salvos em `resultados\confirmacao_impressoras_<data>.txt`.
+
+### Nota técnica — evitando falsos erros do PowerShell com avisos do Nmap
+Toda chamada ao Nmap que **captura a saída** (em vez de deixá-la aparecer direto no console) passa pela função `Invoke-NmapCapturado`. Isso existe por um motivo específico: com `$ErrorActionPreference = "Stop"` ativo no script inteiro, qualquer linha que o Nmap escreva no stream de erro (`stderr`) — mesmo um aviso inofensivo como `WARNING: No targets were specified, so 0 hosts scanned.` (normal em sondagens de broadcast, que não precisam de alvo) — seria promovida pelo PowerShell a uma **exceção fatal**, fazendo o script achar que deu erro quando na verdade só era um aviso comum. A função reverte temporariamente essa preferência só durante a chamada ao Nmap, evitando esse falso positivo.
 
 ---
 
@@ -168,6 +185,30 @@ scanner-rede\
 - Detecção de SO (`-O`) é um **palpite** baseado em características da pilha TCP/IP — não é 100% garantido, principalmente em dispositivos IoT/embarcados (impressoras, câmeras, etc.).
 - **Importante — o que o script NÃO consegue detectar:** ele só enxerga o(s) segmento(s) de rede que o próprio PC onde ele roda está fisicamente conectado. Se um "cabo clandestino" leva a uma rede **totalmente isolada** (com gateway/DHCP próprios, sem nenhuma ligação com a rede corporativa — ex: um roteador com chip 4G próprio, ou uma segunda entrada de internet), nenhum scan de rede consegue ver isso, porque não existe rota de rede até lá. Isso só é detectável fisicamente (testador de cabo/tone tracer nos pontos suspeitos) ou verificando se há circuitos de internet extras entrando no prédio.
 - Se o "cabo clandestino" estiver **conectado/emendado na mesma rede existente** (o cenário mais comum quando não há VLAN) — por exemplo, alguém plugou um switch ou roteador Wi-Fi extra num ponto de rede para ganhar mais portas/Wi-Fi — o script **consegue** flagrar isso de duas formas: (1) o equipamento aparece na lista de dispositivos, e a coluna `PossivelEquipamentoRede` marca "SIM" se o fabricante do MAC for de uma marca de rede; (2) se esse equipamento também distribuir IP via DHCP próprio, a checagem do Passo 5 vai alertar sobre múltiplos servidores DHCP respondendo.
+
+---
+
+## 6. Auditoria técnica e plano de correção
+
+Auditoria completa do script (revisão linha a linha + testes reais contra o Nmap, incluindo contra o caminho real do projeto com espaço/acento) feita em 16/09/2026.
+
+### Encontrado e corrigido
+
+| # | Severidade | Problema | Causa raiz | Correção |
+|---|---|---|---|---|
+| 1 | 🔴 Crítica | Scan principal podia falhar **silenciosamente** (sem erro, sem XML, relatório final mostrando "0 dispositivos") em qualquer pasta com espaço no caminho — inclusive a pasta padrão deste projeto | A barra de progresso ao vivo enviava o comando do Nmap como uma string única pro `cmd.exe`; o PowerShell reaplicava suas próprias regras de aspas por cima da string já formatada, corrompendo o comando | Reescrito para chamar o `nmap.exe` diretamente via `Start-Process` (sem `cmd.exe`), com cada argumento citado manualmente antes de passar (`Start-Process -ArgumentList` não cita automaticamente, diferente do operador `&` usado no resto do script). Testado e confirmado com o caminho real do projeto |
+| 2 | 🟡 Média | Impressora com ping/ICMP bloqueado podia ser classificada incorretamente como "PC provável" | O scan de confirmação de impressora (portas 9100/631/515) não tinha `-Pn`, então tentava redescobrir o host antes de escanear as portas | Adicionado `-Pn` — os hosts já foram confirmados ativos no scan principal, não precisa redescobrir |
+| 3 | 🟢 Baixa (já corrigida em rodada anterior) | Avisos inofensivos do Nmap em `stderr` (ex: `WARNING: No targets were specified`) eram promovidos a erro fatal pelo PowerShell | `$ErrorActionPreference = "Stop"` no escopo do script afeta qualquer captura de `stderr` via `2>&1` | Função `Invoke-NmapCapturado` reverte a preferência de erro localmente, só durante a chamada ao Nmap |
+
+### Verificado e confirmado correto (sem ação necessária)
+- Autoelevação via UAC (`Start-Process -Verb RunAs`) já citava os argumentos corretamente
+- Resolução de nome de interface (`Resolve-NomeInterfaceNmap`) e checagem de DHCP, ambas usando `Invoke-NmapCapturado`/operador `&`, não têm o mesmo risco de aspas do item #1
+- Nenhum outro uso de `Start-Process` no script tem o padrão de risco do item #1
+
+### Backlog (identificado, não crítico, não corrigido nesta rodada)
+- Sem timeout de segurança geral se o processo do Nmap travar por algum motivo externo (driver, rede) durante o scan principal — hoje a barra de progresso ficaria rodando indefinidamente até o processo terminar sozinho
+- `Aguardar-Saida` (pausa no final com "Pressione Enter") assume execução interativa; se alguém tentar rodar o script de forma totalmente automatizada/agendada (sem console interativo), essa pausa bloquearia indefinidamente — não é um problema para o uso pretendido (execução manual, interativa), mas impede automação futura sem um parâmetro tipo `-SemPausa`
+- Um trecho de código em `Get-TipoProvavel` checa por fabricante literalmente igual a `"Unknown"`/`"desconhecido"`, mas o Nmap nunca emite esse texto (ele só omite o atributo quando não reconhece o fabricante) — código inofensivo mas nunca executado na prática, poderia ser removido em uma limpeza futura
 
 ---
 
