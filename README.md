@@ -16,9 +16,10 @@ Script PowerShell que detecta e mapeia automaticamente toda a rede local, gerand
 - **Detecta a rede local automaticamente** (IP + máscara → CIDR), sem precisar informar nada na mão — funciona em qualquer rede, em qualquer computador, sem valores fixos no código
 - **Instala o Nmap sozinho** se não estiver presente, validando a **assinatura digital** do instalador antes de rodar
 - **Escaneia toda a rede** (hosts ativos, MAC, fabricante, SO estimado, portas/serviços abertos)
-- **Classifica o tipo provável de cada dispositivo** (roteador/switch/AP, PC/servidor, impressora, fabricante de contrato/ODM, MAC aleatório/spoofed) cruzando o fabricante do MAC com listas conhecidas
-- **Confirma impressoras automaticamente** via scan de portas específicas (9100/631/515), evitando falsos positivos de fabricantes de chip de rede genérico
+- **Classifica o tipo provável de cada dispositivo** (roteador/switch/AP, PC/servidor, celular/tablet, impressora, fabricante de contrato/ODM, MAC aleatório/spoofed) cruzando o fabricante do MAC com listas conhecidas
+- **Confirma impressoras e serviços UDP automaticamente** (portas 9100/631/515 para impressora; DNS/DHCP/SNMP/mDNS/SSDP e nome NetBIOS via UDP), evitando falsos positivos e preenchendo hostname mesmo sem DNS reverso configurado
 - **Detecta servidor DHCP não autorizado** — alerta quando mais de um servidor responde na mesma rede, indício forte de roteador/AP clandestino
+- **IP e MAC de cada dispositivo no CSV** — cruze direto contra a tabela de leases do PfSense/MikroTik/syslog para identificar o que não está na lista de autorizados
 - **Lembra o que já escaneou** — pula automaticamente redes já mapeadas em execuções anteriores, útil ao testar vários pontos de rede em sequência
 - **Escaneia várias redes em paralelo** (`-Rede 10.5.20.0/24,192.168.1.0/24`), com uma **tabela de log ao vivo** no console — uma linha por fase de cada rede, colorida por status, cronômetro por fase e um cronômetro do início ao fim da operação completa
 - **Numeração de registro + computador de origem** em toda execução, para rastrear/auditar scans ao longo do tempo

@@ -96,6 +96,46 @@ function Get-NomeComputadorCompleto {
     return $env:COMPUTERNAME
 }
 
+function Test-DnsReversoDisponivel {
+    param([string[]]$IpsParaTestar)
+    # Testa de VERDADE, a partir deste PC, se a rede tem DNS reverso (PTR) funcional -
+    # em vez de so supor a causa quando o Hostname vem vazio. Faz resolucao reversa real
+    # contra uma amostra dos IPs ativos encontrados no proprio scan, e reporta o resultado
+    # concreto (quantos resolveram, quais servidores DNS estao configurados nesta maquina)
+    # para o relatorio poder afirmar com dado real, nao suposicao.
+    $dnsServidores = @(
+        [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            Where-Object { $_.OperationalStatus -eq 'Up' } |
+            ForEach-Object { $_.GetIPProperties().DnsAddresses } |
+            Where-Object { $_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork } |
+            Select-Object -ExpandProperty IPAddressToString -Unique
+    )
+
+    $amostra = @($IpsParaTestar | Select-Object -Unique | Select-Object -First 8)
+    $resolvidos = 0
+    $exemplos = @()
+    foreach ($ip in $amostra) {
+        try {
+            $entrada = [Net.Dns]::GetHostEntry($ip)
+            if ($entrada -and $entrada.HostName -and $entrada.HostName -ne $ip) {
+                $resolvidos++
+                $exemplos += "$ip -> $($entrada.HostName)"
+            }
+        } catch {
+            # GetHostEntry lanca excecao quando nao ha registro PTR para o IP - e o
+            # resultado esperado/normal numa rede sem DNS reverso, nao um erro real.
+        }
+    }
+
+    return [PSCustomObject]@{
+        ServidoresDns = $dnsServidores
+        IpsTestados   = $amostra.Count
+        IpsResolvidos = $resolvidos
+        Exemplos      = $exemplos
+        Funcional     = ($resolvidos -gt 0)
+    }
+}
+
 function Invoke-NmapCapturado {
     param([string[]]$NmapArgs)
     # Roda o nmap capturando stdout+stderr juntos, SEM deixar linhas de aviso do
@@ -199,9 +239,13 @@ function Install-Nmap {
 
 # Fabricantes tipicos de equipamento de rede (roteador/switch/AP) - usado para sinalizar
 # no CSV dispositivos que podem ser infraestrutura de rede nao mapeada, nao so "um PC".
+# Nota: "Huawei Technologies" (nao so "Huawei") de proposito - a Huawei tambem fabrica
+# celulares com OUI "Huawei Device Co.", que e uma string DIFERENTE e cairia aqui por
+# engano se o filtro fosse so a palavra "Huawei" (bug encontrado em auditoria: todo
+# celular Huawei estava sendo classificado como roteador).
 $FabricantesEquipamentoRede = @(
     'TP-Link', 'TP-LINK', 'Mercusys', 'D-Link', 'DLink', 'Netgear', 'Ubiquiti', 'MikroTik', 'Mikrotik',
-    'Cisco', 'Huawei', 'Aruba', 'Ruckus', 'Ruijie', 'Zyxel', 'Tenda', 'Intelbras',
+    'Cisco', 'Huawei Technologies', 'Aruba', 'Ruckus', 'Ruijie', 'Zyxel', 'Tenda', 'Intelbras',
     'Multilaser', 'Linksys', 'Fortinet', 'Juniper', 'H3C', 'Extreme Networks',
     'DrayTek', 'Draytek', 'Actiontec', 'Arris', 'Sagemcom', 'Technicolor', 'Sercomm', 'Askey'
 )
@@ -218,6 +262,23 @@ function Test-EquipamentoDeRede([string]$fabricante) {
 $FabricantesPcServidor = @(
     'Gigabyte', 'ASUSTek', 'Asus', 'ASRock', 'Micro-Star', 'MSI', 'Dell', 'Hewlett Packard', 'HP ',
     'Lenovo', 'Supermicro', 'Elitegroup', 'Biostar', 'Intel Corporate'
+)
+
+# Fabricantes cujo OUI e praticamente sempre celular/tablet (nao fabricam PC/notebook, diferente
+# da Apple/Google/Huawei que tem as duas linhas de produto e por isso ficam ambiguos so pelo OUI).
+$FabricantesCelularTablet = @(
+    'Samsung Electronics', 'Xiaomi', 'OPPO', 'Guangdong Oppo', 'vivo Mobile', 'OnePlus',
+    'Motorola Mobility', 'LG Electronics', 'Murata Manufacturing', 'TCT Mobile', 'Sony Mobile',
+    'HMD Global', 'ASUSTek Computer Inc.  (Zenfone)', 'Honor Device', 'Realme Chongqing'
+)
+
+# Fabricantes ambiguos entre PC/notebook e celular/tablet (fazem as duas linhas de produto) -
+# so o SO estimado pelo Nmap desempata com confianca; sem SO, fica marcado como ambiguo mesmo.
+# "Huawei Technologies" (rede/roteador) NAO entra aqui - ja e pego antes, sem ambiguidade,
+# pela lista $FabricantesEquipamentoRede. So "Huawei Device" (linha de celulares) e ambiguo
+# porque a Huawei tambem vende notebooks (linha Matebook) com o mesmo OUI de celular.
+$FabricantesAmbiguoPcOuMovel = @(
+    'Apple', 'Google', 'Huawei Device'
 )
 
 # Fabricantes de contrato/ODM: fabricam placas de rede/hardware para MUITAS marcas diferentes
@@ -262,10 +323,83 @@ function Get-TipoProvavel([string]$fabricante, [string]$mac, [string]$soEstimado
     foreach ($f in $FabricantesContratados) {
         if ($fabricante -match [regex]::Escape($f)) { return "Possivel (fabricante de contrato/ODM)" }
     }
+    foreach ($f in $FabricantesCelularTablet) {
+        if ($fabricante -match [regex]::Escape($f)) { return "Celular / Tablet (provavel)" }
+    }
     foreach ($f in $FabricantesPcServidor) {
         if ($fabricante -match [regex]::Escape($f)) { return "PC / Servidor" }
     }
+    foreach ($f in $FabricantesAmbiguoPcOuMovel) {
+        if ($fabricante -notmatch [regex]::Escape($f)) { continue }
+        # Fabricante ambiguo (ex: Apple faz Mac e iPhone com o mesmo OUI) - usa o SO que o
+        # Nmap estimou, quando disponivel, para desempatar com mais confianca que so o OUI.
+        if ($soEstimado -match 'iOS|iPhone|iPad|Android') { return "Celular / Tablet (provavel)" }
+        if ($soEstimado -match 'Mac OS|macOS') { return "PC / Servidor" }
+        return "PC ou Celular/Tablet ($fabricante - verificar manualmente)"
+    }
     return "Nao classificado"
+}
+
+function Confirm-ServicosUdp {
+    param(
+        [array]$Linhas,
+        [string]$PastaResultados,
+        [string]$Timestamp
+    )
+    # O scan principal e so TCP (-sV/-O padrao do nmap cobrem TCP). Muito equipamento
+    # de rede/IoT/smart-home so responde por UDP em servicos como DNS, DHCP, SNMP,
+    # mDNS/Bonjour (descoberta Apple/impressoras), SSDP/UPnP (descoberta de dispositivos
+    # de rede) - sem essa checagem, esses servicos ficam invisiveis no inventario, mesmo
+    # com o host ja identificado como ativo. Roda como um passo separado e focado (igual
+    # a confirmacao de impressoras), so nos hosts ja confirmados ativos, em vez de somar
+    # ao scan principal (que ja e -O -sV e nao pode misturar --top-ports com uma lista
+    # manual de portas UDP sem regredir a cobertura de portas TCP).
+    if (@($Linhas).Count -eq 0) { return $Linhas }
+
+    $portasUdp = '53,67,68,123,135,137,138,139,161,162,177,427,500,514,520,631,1900,3702,5353,5355'
+
+    Write-Host ""
+    Write-Host "Verificando servicos UDP comuns e nome NetBIOS (DNS/DHCP/SNMP/mDNS/SSDP/hostname Windows) em $(@($Linhas).Count) dispositivo(s)..." -ForegroundColor Cyan
+
+    $ips = $Linhas | Select-Object -ExpandProperty IP -Unique
+    $logPath = Join-Path $PastaResultados "udp_check_$Timestamp.txt"
+
+    try {
+        # -Pn: hosts ja confirmados ativos no scan TCP principal, pula redescoberta -
+        # evita falso negativo se o host bloquear ping mas responder UDP normalmente.
+        # --script nbstat: consulta o nome NetBIOS (porta 137/udp, ja incluida acima) de
+        # maquinas Windows - preenche o Hostname mesmo quando a rede nao tem DNS reverso
+        # configurado (o caso mais comum em redes internas simples), sem depender de DNS.
+        $saida = Invoke-NmapCapturado -NmapArgs (@('-sU', '-Pn', '-p', $portasUdp, '--script', 'nbstat') + $ips)
+        $saida | Out-File -FilePath $logPath -Encoding UTF8
+    } catch {
+        Write-Host "  Nao foi possivel checar portas UDP: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $Linhas
+    }
+
+    $blocos = ($saida -join "`n") -split '(?=Nmap scan report for )'
+    foreach ($bloco in $blocos) {
+        if ($bloco -notmatch 'Nmap scan report for (?:\S+\s+\(([\d.]+)\)|([\d.]+))') { continue }
+        $ipBloco = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+
+        $linha = $Linhas | Where-Object { $_.IP -eq $ipBloco } | Select-Object -First 1
+        if (-not $linha) { continue }
+
+        $portasUdpAbertas = [regex]::Matches($bloco, '(?m)^(\d+)/udp\s+open\s+(\S+)') | ForEach-Object {
+            "$($_.Groups[1].Value)/udp($($_.Groups[2].Value))"
+        }
+        if ($portasUdpAbertas.Count -gt 0) {
+            $existente = if ($linha.PortasAbertas) { "$($linha.PortasAbertas); " } else { "" }
+            $linha.PortasAbertas = $existente + ($portasUdpAbertas -join "; ")
+        }
+
+        if (-not $linha.Hostname -and $bloco -match 'NetBIOS name:\s*([^,\r\n]+?)\s*,') {
+            $linha.Hostname = $Matches[1].Trim()
+        }
+    }
+
+    Write-Host "  Detalhes salvos em: $logPath" -ForegroundColor Cyan
+    return $Linhas
 }
 
 function Confirm-Impressoras {
@@ -296,11 +430,17 @@ function Confirm-Impressoras {
         return $Linhas
     }
 
-    # Quebra a saida do nmap por host (cada bloco comeca com "Nmap scan report for <ip>")
+    # Quebra a saida do nmap por host (cada bloco comeca com "Nmap scan report for <ip>",
+    # ou "Nmap scan report for <hostname> (<ip>)" quando o DNS reverso resolve um nome).
     $blocos = ($saida -join "`n") -split '(?=Nmap scan report for )'
     foreach ($bloco in $blocos) {
-        if ($bloco -notmatch 'Nmap scan report for (\S+)') { continue }
-        $ipBloco = $Matches[1]
+        if ($bloco -notmatch 'Nmap scan report for (?:\S+\s+\(([\d.]+)\)|([\d.]+))') { continue }
+        # Bug de auditoria corrigido: quando ha hostname resolvido, o IP fica entre
+        # parenteses (grupo 1); sem hostname, o IP vem sozinho logo apos "for" (grupo 2).
+        # A regex antiga so pegava o primeiro token depois de "for", que virava o
+        # HOSTNAME (nao o IP) sempre que havia resolucao de DNS reverso - fazendo a
+        # comparacao por IP logo abaixo falhar silenciosamente pra esses casos.
+        $ipBloco = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
         $temPortaAberta = $bloco -match '(?m)^(9100|631|515)/tcp\s+open'
 
         $linha = $Linhas | Where-Object { $_.IP -eq $ipBloco } | Select-Object -First 1
@@ -391,7 +531,8 @@ function New-RelatorioResumo {
         [string]$PastaResultados,
         [string]$TempoTotal = "",
         [string]$NumeroRegistro = "",
-        [string]$Computador = ""
+        [string]$Computador = "",
+        [PSCustomObject]$DiagnosticoDns = $null
     )
 
     $linhasTexto = New-Object System.Collections.Generic.List[string]
@@ -416,6 +557,21 @@ function New-RelatorioResumo {
     & $add ""
     & $add "Total geral de dispositivos ativos encontrados: $($Linhas.Count)"
     & $add ""
+
+    if ($DiagnosticoDns) {
+        & $add "--------------------------------------------------------"
+        & $add "Diagnostico de DNS reverso (testado a partir deste PC)"
+        & $add "--------------------------------------------------------"
+        $servidoresTexto = if ($DiagnosticoDns.ServidoresDns.Count -gt 0) { $DiagnosticoDns.ServidoresDns -join ', ' } else { "(nenhum servidor DNS configurado nesta maquina)" }
+        & $add "  Servidor(es) DNS configurado(s) nesta maquina: $servidoresTexto"
+        if ($DiagnosticoDns.Funcional) {
+            & $add "  RESULTADO: DNS reverso FUNCIONAL - $($DiagnosticoDns.IpsResolvidos) de $($DiagnosticoDns.IpsTestados) IP(s) testado(s) retornaram nome via PTR."
+        } else {
+            & $add "  RESULTADO: DNS reverso NAO configurado/funcional nesta rede - 0 de $($DiagnosticoDns.IpsTestados) IP(s) testado(s) retornaram nome via PTR."
+            & $add "  Por isso a coluna Hostname depende do nome NetBIOS (maquinas Windows), quando disponivel."
+        }
+        & $add ""
+    }
 
     $equipamentos = @($Linhas | Where-Object { $_.PossivelEquipamentoRede -eq "SIM" })
     & $add "--------------------------------------------------------"
@@ -498,7 +654,8 @@ function New-RelatorioHtml {
         [string]$PastaResultados,
         [string]$TempoTotal = "",
         [string]$NumeroRegistro = "",
-        [string]$Computador = ""
+        [string]$Computador = "",
+        [PSCustomObject]$DiagnosticoDns = $null
     )
 
     $Faixas = @($Faixas)
@@ -507,6 +664,15 @@ function New-RelatorioHtml {
     $equipamentos = @($Linhas | Where-Object { $_.PossivelEquipamentoRede -eq "SIM" })
     $alertasDhcpCriticos = @($AlertasDhcp | Where-Object { $_.QtdServidores -gt 1 })
     $dataFormatada = Get-Date -Date ([datetime]::ParseExact($Timestamp, 'yyyy-MM-dd_HHmmss', $null)) -Format 'dd/MM/yyyy HH:mm:ss'
+
+    $dnsHtml = if ($DiagnosticoDns) {
+        $servidoresTexto = if ($DiagnosticoDns.ServidoresDns.Count -gt 0) { $DiagnosticoDns.ServidoresDns -join ', ' } else { "nenhum servidor DNS configurado nesta maquina" }
+        if ($DiagnosticoDns.Funcional) {
+            "<span class='badge badge-ok'>DNS reverso funcional</span> $($DiagnosticoDns.IpsResolvidos)/$($DiagnosticoDns.IpsTestados) IP(s) testado(s) resolveram nome. Servidor(es): $(ConvertTo-TextoHtml $servidoresTexto)"
+        } else {
+            "<span class='badge badge-neutro'>DNS reverso nao configurado</span> 0/$($DiagnosticoDns.IpsTestados) IP(s) testado(s) resolveram nome via PTR. Servidor(es): $(ConvertTo-TextoHtml $servidoresTexto). O Hostname depende do nome NetBIOS (Windows) quando disponivel."
+        }
+    } else { $null }
 
     $linhasPorRedeHtml = foreach ($faixa in $Faixas) {
         $qtd = @($Linhas | Where-Object { $_.Rede -eq $faixa }).Count
@@ -547,6 +713,10 @@ function New-RelatorioHtml {
     $icoRede         = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15 15 0 0 1 0 20a15 15 0 0 1 0-20z"></path></svg>'
     $icoAlerta       = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>'
     $icoRoteador     = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="9" width="20" height="8" rx="2"></rect><line x1="6.5" y1="13" x2="6.51" y2="13"></line><line x1="9.5" y1="13" x2="9.51" y2="13"></line><path d="M12 9V5a2 2 0 0 1 2-2h1"></path></svg>'
+
+    $dnsCardHtml = if ($dnsHtml) {
+        "<div class='card'><div class='card-titulo'>$icoAlerta Diagnostico de DNS reverso (testado a partir deste PC)</div><table><tbody><tr><td>$dnsHtml</td></tr></tbody></table></div>"
+    } else { "" }
 
     $html = @"
 <!DOCTYPE html>
@@ -734,6 +904,8 @@ function New-RelatorioHtml {
         <tbody>$($linhasDhcpHtml -join "`n")</tbody>
       </table>
     </div>
+
+    $dnsCardHtml
 
     <div class="card">
       <div class="card-titulo">$icoDispositivos Inventario completo</div>
@@ -956,6 +1128,7 @@ function Invoke-NmapsComLogParalelo {
             XmlPath             = $xmlPath
             OutPath             = $outPath
             ErrPath             = $errPath
+            ArgsQuoted          = $argsQuoted
             Processo            = $processo
             Cronometro          = [Diagnostics.Stopwatch]::StartNew()
             Concluido           = $false
@@ -963,6 +1136,7 @@ function Invoke-NmapsComLogParalelo {
             PercentualLogado    = -1.0
             EtaLogado           = "-"
             LinhaViva           = $null
+            TentouNovamente     = $false
         }
     }
 
@@ -986,9 +1160,37 @@ function Invoke-NmapsComLogParalelo {
             if ($t.Concluido) { continue }
 
             if ($t.Processo.HasExited) {
+                $ok = ($t.Processo.ExitCode -eq 0)
+
+                if (-not $ok -and -not $t.TentouNovamente) {
+                    # "Got nsock WRITE/READ error" e outros erros de nsock sao falhas do
+                    # driver Npcap/Winsock (driver desatualizado, VPN/antivirus interferindo
+                    # na captura de pacotes, instabilidade momentanea) - nao sao causados pelo
+                    # scan em si, e geralmente somem numa segunda tentativa. Tenta de novo
+                    # UMA vez antes de desistir dessa faixa, em vez de falhar na primeira.
+                    $erroTexto = if (Test-Path $t.ErrPath) { (Get-Content $t.ErrPath -Raw) } else { "" }
+                    if ($erroTexto -match 'nsock') {
+                        $t.TentouNovamente = $true
+                        Remove-Item $t.OutPath, $t.ErrPath -Force -ErrorAction SilentlyContinue
+
+                        $linhaRetry = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "0.0%" -Eta "-" -Status "erro driver, retry..." -CorStatus $script:ansiVermelho
+                        Write-LinhaLogParalelo -Texto $linhaRetry -LinhaExistente $t.LinhaViva | Out-Null
+
+                        $t.Processo = Start-Process -FilePath $script:nmapExe -ArgumentList $t.ArgsQuoted `
+                            -RedirectStandardOutput $t.OutPath -RedirectStandardError $t.ErrPath -PassThru -NoNewWindow
+                        $t.Cronometro = [Diagnostics.Stopwatch]::StartNew()
+                        $t.FaseLogada = ""
+                        $t.PercentualLogado = -1.0
+                        $t.EtaLogado = "-"
+
+                        $linhaNova = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "0.0%" -Eta "-" -Status "iniciado" -CorStatus $script:ansiCiano
+                        $t.LinhaViva = Write-LinhaLogParalelo -Texto $linhaNova
+                        continue
+                    }
+                }
+
                 $t.Concluido = $true
                 $t.Cronometro.Stop()
-                $ok = ($t.Processo.ExitCode -eq 0)
                 $status = if ($ok) { "concluido em $(Format-Decorrido $t.Cronometro.Elapsed)" } else { "erro (codigo $($t.Processo.ExitCode))" }
                 $corStatus = if ($ok) { $script:ansiVerde } else { $script:ansiVermelho }
                 $linha = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "100.0%" -Eta "-" -Status $status -CorStatus $corStatus
@@ -1034,7 +1236,21 @@ function Invoke-NmapsComLogParalelo {
             # coluna "hora" andando feito um cronometro de verdade, em vez de travada
             # esperando a proxima leitura de percentual.
             if (-not $linhaJaAtualizada -and $t.FaseLogada -and $null -ne $t.LinhaViva) {
-                $linha = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase $t.FaseLogada -Percentual ("{0:0.0}%" -f $t.PercentualLogado) -Eta $t.EtaLogado -Status "em andamento" -CorStatus $script:ansiAmarelo
+                # Uma vez que o Nmap reporta 100% de uma fase, o ETC dele fica obsoleto/errado
+                # (ele pode continuar rodando por bastante tempo ainda, fechando conexoes e
+                # aguardando timeouts) - em vez de mostrar "em andamento" com um ETA que nao
+                # significa mais nada, mostra "finalizando" sem ETA, que e o que de fato esta
+                # acontecendo: a fase nao mudou ainda, mas tambem nao esta mais progredindo.
+                if ($t.PercentualLogado -ge 100) {
+                    $statusAtual = "finalizando"
+                    $corStatusAtual = $script:ansiLaranja
+                    $etaAtual = "-"
+                } else {
+                    $statusAtual = "em andamento"
+                    $corStatusAtual = $script:ansiAmarelo
+                    $etaAtual = $t.EtaLogado
+                }
+                $linha = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase $t.FaseLogada -Percentual ("{0:0.0}%" -f $t.PercentualLogado) -Eta $etaAtual -Status $statusAtual -CorStatus $corStatusAtual
                 $t.LinhaViva = Write-LinhaLogParalelo -Texto $linha -LinhaExistente $t.LinhaViva
             } elseif (-not $linhaJaAtualizada -and -not $t.FaseLogada -and $null -ne $t.LinhaViva) {
                 # Ainda na fase "-" inicial (nenhuma fase do nmap detectada ainda).
@@ -1049,7 +1265,11 @@ function Invoke-NmapsComLogParalelo {
     foreach ($t in $tarefas) {
         if ($t.Processo.ExitCode -ne 0) {
             $erroTexto = if (Test-Path $t.ErrPath) { (Get-Content $t.ErrPath -Raw) } else { "" }
-            Write-Host "  Aviso: nmap para $($t.Faixa) terminou com codigo $($t.Processo.ExitCode). $erroTexto" -ForegroundColor Yellow
+            if ($erroTexto -match 'nsock') {
+                Write-Host "  Aviso: nmap para $($t.Faixa) terminou com erro de driver (nsock) mesmo apos tentar de novo. Isso normalmente indica Npcap desatualizado, VPN/antivirus interferindo na captura de pacotes, ou instabilidade momentanea do driver de rede - atualize o Npcap (nmap.org/npcap) e rode de novo. Detalhe: $erroTexto" -ForegroundColor Yellow
+            } else {
+                Write-Host "  Aviso: nmap para $($t.Faixa) terminou com codigo $($t.Processo.ExitCode). $erroTexto" -ForegroundColor Yellow
+            }
         }
         Remove-Item $t.OutPath, $t.ErrPath -Force -ErrorAction SilentlyContinue
     }
@@ -1319,6 +1539,16 @@ try {
     }
 
     $linhasTotais = Confirm-Impressoras -Linhas $linhasTotais -PastaResultados $pastaResultados -Timestamp $timestamp
+    $linhasTotais = Confirm-ServicosUdp -Linhas $linhasTotais -PastaResultados $pastaResultados -Timestamp $timestamp
+
+    Write-Host ""
+    Write-Host "Verificando se ha DNS reverso funcional nesta rede (explica o Hostname vazio, quando for o caso)..." -ForegroundColor Cyan
+    $diagnosticoDns = Test-DnsReversoDisponivel -IpsParaTestar ($linhasTotais | Select-Object -ExpandProperty IP)
+    if ($diagnosticoDns.Funcional) {
+        Write-Host "  DNS reverso funcional: $($diagnosticoDns.IpsResolvidos) de $($diagnosticoDns.IpsTestados) IP(s) testado(s) resolveram nome." -ForegroundColor Green
+    } else {
+        Write-Host "  DNS reverso NAO respondeu para nenhum dos $($diagnosticoDns.IpsTestados) IP(s) testado(s) - por isso a coluna Hostname depende do nome NetBIOS (Windows) quando disponivel." -ForegroundColor Yellow
+    }
 
     $csvPath = Join-Path $pastaResultados "inventario_$timestamp.csv"
     $linhasTotais | Sort-Object Rede, { [version]($_.IP -replace '^\D+', '') } -ErrorAction SilentlyContinue | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
@@ -1326,8 +1556,8 @@ try {
     $cronometroTotal.Stop()
     $tempoTotalTexto = Format-Decorrido $cronometroTotal.Elapsed
 
-    $resumoPath = New-RelatorioResumo -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto -NumeroRegistro $numeroRegistro -Computador $nomeComputador
-    $htmlPath = New-RelatorioHtml -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto -NumeroRegistro $numeroRegistro -Computador $nomeComputador
+    $resumoPath = New-RelatorioResumo -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto -NumeroRegistro $numeroRegistro -Computador $nomeComputador -DiagnosticoDns $diagnosticoDns
+    $htmlPath = New-RelatorioHtml -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto -NumeroRegistro $numeroRegistro -Computador $nomeComputador -DiagnosticoDns $diagnosticoDns
 
     Write-Host ""
     Write-Host "Concluido em $tempoTotalTexto! $($linhasTotais.Count) dispositivos ativos encontrados no total." -ForegroundColor Green

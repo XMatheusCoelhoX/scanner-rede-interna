@@ -121,7 +121,7 @@ Lê o XML gerado e monta uma tabela com uma linha por dispositivo ativo encontra
 | PossivelEquipamentoRede | "SIM" se o fabricante bate com marcas típicas de roteador/switch/AP (TP-Link, Mercusys, Ubiquiti, MikroTik, Cisco, etc.) — vale checar essas linhas primeiro |
 | TipoProvavel | Classificação mais detalhada do tipo de dispositivo (ver Passo 7.5) |
 | SO_Estimado | Palpite de sistema operacional do Nmap |
-| PortasAbertas | Lista de portas abertas com serviço/versão detectados |
+| PortasAbertas | Lista de portas abertas (TCP com serviço/versão detectados, mais UDP confirmado no Passo 7.6) |
 | DataScan | Timestamp da execução |
 | NumeroRegistro | Número de registro sequencial da execução (ex: `000007`) — ver seção 2.1 |
 | ComputadorOrigem | Nome (FQDN quando disponível) do computador de onde o scan foi rodado |
@@ -134,8 +134,10 @@ Além do fabricante bruto, o script tenta adivinhar o **tipo** de cada dispositi
 
 | TipoProvavel | Quando aparece |
 |---|---|
-| `Roteador / AP / Switch` | Fabricante é marca de rede conhecida (TP-Link, Mercusys, Ubiquiti, D-Link, Cisco, etc.) |
+| `Roteador / AP / Switch` | Fabricante é marca de rede conhecida (TP-Link, Mercusys, Ubiquiti, D-Link, Cisco, Huawei Technologies, etc.) |
+| `Celular / Tablet (provavel)` | Fabricante é marca que só faz celular/tablet (Samsung, Xiaomi, OPPO, vivo, OnePlus, Motorola, LG, Sony Mobile, Honor, Realme, etc.) |
 | `PC / Servidor` | Fabricante é marca de placa-mãe/sistema (Gigabyte, ASUS, Dell, HP, Lenovo, MSI, etc.) |
+| `PC ou Celular/Tablet (verificar manualmente)` | Fabricante ambíguo entre as duas linhas de produto (Apple, Google, Huawei Device — fazem PC/notebook **e** celular com o mesmo OUI). O script tenta desempatar pelo SO estimado (`iOS`/`Android` → celular, `macOS` → PC); sem SO estimado, fica marcado como ambíguo mesmo, para não arriscar um palpite errado |
 | `Possivel (fabricante de contrato/ODM)` | Fabricante é uma montadora de contrato (Foxconn/Hon Hai, Pegatron, Quanta, etc.) — eles fabricam hardware pra dezenas de marcas diferentes (impressoras, roteadores, notebooks white-label), então o tipo real fica ambíguo só pelo OUI |
 | `Impressora confirmada (porta de impressao aberta)` | Fabricante tem chip de rede genérico (ex: Realtek — comum tanto em impressoras quanto em PCs), **e** o script confirmou via scan extra que a porta 9100 (RAW/JetDirect), 631 (IPP) ou 515 (LPD) está aberta |
 | `PC provavel (chip Realtek/generico, sem porta de impressao)` | Mesmo fabricante ambíguo acima, mas **nenhuma** porta de impressão respondeu — ou seja, é provavelmente só um PC comum com aquele chip de rede onboard, não uma impressora de verdade |
@@ -144,6 +146,19 @@ Além do fabricante bruto, o script tenta adivinhar o **tipo** de cada dispositi
 | `Nao classificado` | Fabricante reconhecido, mas não bate com nenhuma das listas acima |
 
 **Confirmação automática de impressoras:** depois do scan principal, o script roda um scan extra e focado (`nmap -Pn -p 9100,631,515`) só nos hosts marcados como "possível impressora" pelo fabricante ambíguo, pra confirmar de verdade antes de você sair procurando uma impressora que na real é só um PC. O `-Pn` pula a redescoberta de host (esses IPs já foram confirmados ativos no scan principal) — sem ele, uma impressora com ping/ICMP bloqueado seria incorretamente classificada como "PC provável" por não responder à sondagem de host. Detalhes salvos em `resultados\confirmacao_impressoras_<data>.txt`.
+
+> **Nota de auditoria (corrigido):** dois bugs de classificação foram encontrados e corrigidos em auditoria completa do script: (1) o fabricante `"Huawei"` na lista de equipamento de rede batia por substring com `"Huawei Device"` (celulares), classificando celulares Huawei como roteador — corrigido para `"Huawei Technologies"` (mais específico, só bate na divisão de redes); (2) a extração do IP na confirmação de impressoras usava uma regex que capturava o **hostname** em vez do IP sempre que o dispositivo tinha DNS reverso resolvendo (`Nmap scan report for impressora.local (192.168.1.5)`), fazendo a confirmação falhar silenciosamente para esses casos — corrigido para extrair o IP de dentro dos parênteses quando presente.
+
+### Passo 7.6 — Verificação de serviços UDP e nome NetBIOS
+O scan principal (Passo 6) é só TCP. Muito equipamento de rede/IoT/smart-home só responde em serviços UDP — DNS, DHCP, SNMP, mDNS/Bonjour, SSDP/UPnP, WS-Discovery — que ficariam invisíveis no inventário mesmo com o host já confirmado ativo. Depois da confirmação de impressoras, o script roda uma checagem UDP focada e rápida (`nmap -sU -Pn -p 53,67,68,123,135,137,138,139,161,162,177,427,500,514,520,631,1900,3702,5353,5355 --script nbstat`) contra todos os IPs já encontrados, e:
+
+- Adiciona qualquer porta UDP confirmada **aberta** (não conta `open|filtered`, que é um estado ambíguo — o script só reporta o que tem certeza) na coluna `PortasAbertas`, junto com as portas TCP
+- Usa o script `nbstat` do Nmap pra consultar o **nome NetBIOS** (porta 137/UDP) de máquinas Windows e preencher a coluna `Hostname` **mesmo sem DNS reverso configurado na rede** — o cenário mais comum em redes internas simples, onde o hostname ficaria vazio de outra forma
+
+Detalhes salvos em `resultados\udp_check_<data>.txt`.
+
+### Passo 7.7 — Diagnóstico de DNS reverso (dado real, não suposição)
+Antes de gerar os relatórios, o script testa **de verdade**, a partir do próprio PC que está rodando o scan, se a rede tem DNS reverso (PTR) funcional: pega uma amostra de até 8 IPs ativos encontrados e tenta resolver o nome de cada um via `[Net.Dns]::GetHostEntry`. O resultado concreto (quantos resolveram, quais servidores DNS estão configurados nesta máquina) aparece no console, no resumo em texto e no relatório HTML — para que a conclusão "hostname vazio" venha acompanhada de um dado verificável, não de uma suposição.
 
 ### Nota técnica — evitando falsos erros do PowerShell com avisos do Nmap
 Toda chamada ao Nmap que **captura a saída** (em vez de deixá-la aparecer direto no console) passa pela função `Invoke-NmapCapturado`. Isso existe por um motivo específico: com `$ErrorActionPreference = "Stop"` ativo no script inteiro, qualquer linha que o Nmap escreva no stream de erro (`stderr`) — mesmo um aviso inofensivo como `WARNING: No targets were specified, so 0 hosts scanned.` (normal em sondagens de broadcast, que não precisam de alvo) — seria promovida pelo PowerShell a uma **exceção fatal**, fazendo o script achar que deu erro quando na verdade só era um aviso comum. A função reverte temporariamente essa preferência só durante a chamada ao Nmap, evitando esse falso positivo.
@@ -164,6 +179,7 @@ scanner-rede\
     ├── scan_<rede>_<data>.xml               <- saida bruta do Nmap
     ├── dhcp_check_<adaptador>_<data>.txt     <- resultado da checagem de DHCP nao autorizado
     ├── confirmacao_impressoras_<data>.txt    <- resultado do scan de confirmacao de impressoras
+    ├── udp_check_<data>.txt                  <- resultado da checagem de servicos UDP e nome NetBIOS
     ├── inventario_<data>.csv                <- inventario completo (Excel)
     ├── resumo_<data>.txt                    <- resumo em texto
     └── relatorio_<data>.html                <- relatorio visual para apresentacao (abrir no navegador, Ctrl+P -> PDF)
@@ -243,6 +259,35 @@ Depois da auditoria acima, o recurso de progresso evoluiu de uma barra única se
 | 5 | 🟡 Média | Spinner e barra apareciam como caracteres vazios ("tofu"/retângulos) no console real, mesmo com o script rodando sem erro | A codepage do console do Windows não estava em UTF-8 (65001); o .NET mandava bytes UTF-8 mas o `conhost` interpretava com outra codepage | Adicionado `chcp.com 65001` + `[Console]::OutputEncoding = [Text.Encoding]::UTF8` logo após a autoelevação |
 | 6 | 🟡 Média | Nomes de fase longos do Nmap (ex: `Parallel DNS resolution of 13 hosts.`) estouravam a largura da coluna "fase" e desalinhavam toda a tabela daquela linha em diante | A função de formatação da linha não cortava valores mais compridos que a coluna antes de alinhar | Adicionado `Format-TextoTruncado`, aplicado a todas as colunas de largura fixa antes do alinhamento/centralização |
 | 7 | 🟢 Baixa | `-Rede` com múltiplas faixas (`-Rede a,b`) não funcionava quando o script se autoelevava (relançava a si mesmo) | `Start-Process -File` não reaplica o split automático de vírgula que o parser do PowerShell faz numa invocação direta | Normalização explícita logo após o `param()` (`$_ -split ','`), que cobre os dois casos (array já separado ou string única com vírgulas vinda do relançamento) |
+
+### Auditoria completa — 16/09/2026, rodada 3 (revisão linha a linha das ~1400 linhas do script)
+
+Revisão de todo o script, função por função, incluindo teste isolado de cada regex/lógica de classificação alterada. Objetivo explícito desta rodada: sustentar dados **precisos e defensáveis** para apresentação à diretoria (nenhuma alegação sem verificação real).
+
+| # | Severidade | Problema | Causa raiz | Correção |
+|---|---|---|---|---|
+| 8 | 🔴 Crítica (introduzido na sessão anterior) | Celulares Huawei eram classificados como `Roteador / AP / Switch` | O filtro de equipamento de rede tinha só `"Huawei"` (substring), que também batia em `"Huawei Device Co."` (fabricante de celular) — e a checagem de roteador roda antes da checagem de celular na ordem de classificação | Filtro trocado para `"Huawei Technologies"` (mais específico, só bate na divisão de redes/roteadores) |
+| 9 | 🟡 Média | Confirmação de impressora falhava silenciosamente (ficava presa em "Possível impressora") para qualquer dispositivo com DNS reverso resolvendo | A regex `Nmap scan report for (\S+)` capturava o **hostname** em vez do IP quando a linha vinha como `Nmap scan report for impressora.local (192.168.1.5)`; a comparação seguinte é por IP, então nunca batia | Regex corrigida para extrair o IP de dentro dos parênteses quando há hostname, ou direto quando não há. Testado com os dois casos |
+| 10 | 🟢 Baixa | Mensagem de status do retry de driver (`"erro de driver, tentando de novo"`, 33 caracteres) estourava a coluna de 24 caracteres e cortava no meio da frase | Faltava ajustar o texto à largura fixa da coluna | Mensagem encurtada para `"erro driver, retry..."` (cabe na coluna) |
+
+### Resposta explícita: o script identifica IPs "não autorizados"?
+
+**Não, hoje não — e isso precisa ficar claro na apresentação.** O script faz **inventário + heurística de suspeita**, não **verificação de autorização**:
+
+1. Lista todo IP/MAC ativo encontrado (inventário completo)
+2. Marca `PossivelEquipamentoRede = SIM` quando o fabricante do MAC bate com marca típica de roteador/switch/AP
+3. Alerta quando mais de um servidor DHCP responde na mesma rede (forte indício de equipamento não documentado)
+
+Isso é **inferência por heurística**. Não existe hoje uma lista de dispositivos autorizados (MACs esperados) para comparar contra o inventário e dizer com certeza "este dispositivo específico é não autorizado". Um notebook comum plugado numa porta indevida, por exemplo, não seria flagrado — porque nada no fabricante dele sugere "equipamento de rede" e ele não distribui DHCP. **A afirmação correta e defensável para a diretoria é: "N dispositivos ativos encontrados, dos quais X têm características de equipamento de rede não documentado e Y indicam DHCP duplicado"** — não "N dispositivos não autorizados". Implementar uma baseline real de autorização (lista de MACs esperados) foi avaliado e adiado a pedido — fica registrado aqui como item de backlog caso a necessidade mude.
+
+**Fluxo de correlação recomendado (decidido em vez da baseline interna):** em vez do script tentar adivinhar autorização, o CSV gerado já traz exatamente as duas chaves necessárias — `IP` e `MAC` — para cruzar manualmente contra a tabela de leases DHCP / tabela ARP do PfSense, MikroTik ou syslog do firewall. Qualquer IP/MAC que apareça no inventário do scanner e **não** apareça na lista de leases autorizados desses sistemas é candidato real a não autorizado. Esse cruzamento é mais confiável do que qualquer heurística de fabricante, porque usa a fonte de verdade real da rede (o que o DHCP realmente distribuiu/reconhece). A cobertura de descoberta do scanner já é bem próxima de 100% na rede local, porque o Nmap usa ARP (protocolo de camada 2, não pode ser bloqueado por firewall de host) para achar hosts ativos quando a faixa escaneada é a mesma rede onde o PC está fisicamente conectado — que é o cenário padrão (detecção automática, sem `-Rede`).
+
+### Melhorias de cobertura — 16/09/2026, rodada 3
+
+- **Verificação de serviços UDP** (`Confirm-ServicosUdp`, Passo 7.6): o scan principal só cobre TCP; adicionada uma checagem UDP focada (DNS, DHCP, SNMP, mDNS, SSDP, etc.) contra os hosts já confirmados ativos, cujo resultado (só portas confirmadas `open`, nunca `open|filtered` ambíguo) entra na coluna `PortasAbertas`
+- **Hostname via NetBIOS**: a mesma checagem UDP usa o script `nbstat` do Nmap (porta 137/UDP) para obter o nome de máquinas Windows mesmo sem DNS reverso configurado — resolve o problema de a coluna `Hostname` vir vazia na maioria das redes internas simples
+- **Diagnóstico real de DNS reverso** (`Test-DnsReversoDisponivel`, Passo 7.7): em vez de só *supor* que a rede não tem DNS reverso, o script agora testa de verdade (resolução PTR contra uma amostra de IPs ativos, a partir do próprio PC do scan) e reporta o resultado concreto no resumo e no relatório HTML
+- **Avaliado e adiado a pedido:** `-Pn` no scan principal (trataria todo IP da faixa como ativo, garantindo que nenhum host com firewall bem fechado fique fora do inventário) — mantido desligado por enquanto, pelo custo de tempo numa faixa /24 completa
 
 ---
 

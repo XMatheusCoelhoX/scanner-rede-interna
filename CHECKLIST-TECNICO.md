@@ -49,11 +49,13 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 10. [ ] Lê o XML gerado e monta uma linha por host ativo (`status=up`), extraindo IP, MAC, fabricante, hostname, portas abertas, SO estimado
 11. [ ] Classifica cada host em um **Tipo Provável** (roteador/switch, PC/servidor, fabricante de contrato, MAC aleatório, etc.) cruzando o fabricante do MAC com listas conhecidas + checagem bit a bit do MAC
 12. [ ] Roda uma **confirmação extra de impressoras** (`nmap -Pn -p 9100,631,515`) só nos hosts cujo fabricante é ambíguo (chip de rede genérico tipo Realtek) — o `-Pn` evita falso negativo em impressoras com ICMP/ping bloqueado
-13. [ ] Marca a(s) faixa(s) recém-escaneada(s) como "conhecida(s)" em `redes_conhecidas.json`
-14. [ ] Exporta o inventário completo em CSV
-15. [ ] Gera o **resumo em texto** (contagens, alertas, top fabricantes/SOs)
-16. [ ] Gera o **relatório visual em HTML** (cards, tabelas, destaques)
-17. [ ] Mostra a mensagem final de conclusão e **pausa a janela** (não fecha sozinha) até apertar Enter — tanto em sucesso quanto em erro
+13. [ ] Roda uma **checagem de serviços UDP + nome NetBIOS** (`nmap -sU -Pn -p <lista> --script nbstat`) contra todos os hosts já encontrados — soma portas UDP confirmadas abertas em `PortasAbertas` e preenche `Hostname` via NetBIOS quando o DNS reverso não resolve
+14. [ ] Testa **de verdade** (não supõe) se a rede tem DNS reverso funcional, resolvendo uma amostra de até 8 IPs ativos via `[Net.Dns]::GetHostEntry` a partir do próprio PC do scan
+15. [ ] Marca a(s) faixa(s) recém-escaneada(s) como "conhecida(s)" em `redes_conhecidas.json`
+16. [ ] Exporta o inventário completo em CSV
+17. [ ] Gera o **resumo em texto** (contagens, alertas, top fabricantes/SOs, diagnóstico de DNS reverso)
+18. [ ] Gera o **relatório visual em HTML** (cards, tabelas, destaques, card de diagnóstico de DNS reverso)
+19. [ ] Mostra a mensagem final de conclusão e **pausa a janela** (não fecha sozinha) até apertar Enter — tanto em sucesso quanto em erro
 
 ---
 
@@ -66,12 +68,14 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 | `Get-CaminhoRedesConhecidas` / `Get-RedesConhecidas` / `Save-RedeConhecida` | Leitura/escrita da "memória" de redes já escaneadas (`redes_conhecidas.json`) |
 | `Get-ProximoNumeroRegistro` | Incrementa e persiste o número de registro sequencial da execução (`registro_scans.json`) |
 | `Get-NomeComputadorCompleto` | Resolve o nome completo (FQDN) do computador de origem, com fallback para o nome curto do Windows |
+| `Test-DnsReversoDisponivel` | Testa de verdade (resolução PTR real) se a rede tem DNS reverso funcional, contra uma amostra de IPs ativos |
 | `Invoke-NmapCapturado` | Roda o Nmap capturando stdout+stderr juntos sem deixar avisos em stderr virarem erro fatal do PowerShell (ver seção 12) |
 | `Install-Nmap` | Baixa, valida assinatura digital, e instala o Nmap silenciosamente |
 | `Test-EquipamentoDeRede` | Verifica se o fabricante do MAC bate com marca conhecida de roteador/switch/AP |
 | `Test-MacLocalmenteAdministrado` | Checa o bit "locally administered" do MAC (identifica endereço aleatório/spoofed) |
 | `Get-TipoProvavel` | Classifica o tipo provável de dispositivo (roteador, PC, impressora, ODM, etc.) |
 | `Confirm-Impressoras` | Roda scan extra nas portas 9100/631/515 (com `-Pn`) para confirmar impressoras suspeitas |
+| `Confirm-ServicosUdp` | Roda scan UDP focado (DNS/DHCP/SNMP/mDNS/SSDP/etc. + script `nbstat`) para completar `PortasAbertas` e preencher `Hostname` via NetBIOS |
 | `Resolve-NomeInterfaceNmap` | Descobre o nome de interface que o Nmap usa (`eth0`, `eth1`...) casando pelo IP, já que difere do nome do Windows |
 | `Find-DhcpNaoAutorizado` | Roda a sondagem de broadcast DHCP e alerta se houver mais de um servidor respondendo |
 | `New-RelatorioResumo` | Gera o resumo em texto (`resumo_<data>.txt`), incluindo o tempo total da execução |
@@ -99,6 +103,7 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 | `resultados\scan_<rede>_<data>.xml` | resultados\ | A cada faixa escaneada (em paralelo) | Saída bruta e completa do Nmap (formato XML) |
 | `resultados\dhcp_check_<adaptador>_<data>.txt` | resultados\ | A cada checagem de DHCP | Saída bruta do script NSE `broadcast-dhcp-discover` |
 | `resultados\confirmacao_impressoras_<data>.txt` | resultados\ | Quando há suspeitos de impressora | Saída do scan focado nas portas 9100/631/515 |
+| `resultados\udp_check_<data>.txt` | resultados\ | Ao final de cada execução (se houver hosts ativos) | Saída do scan UDP focado + script `nbstat` |
 | `resultados\inventario_<data>.csv` | resultados\ | Ao final de cada execução | Inventário completo, uma linha por dispositivo — abre no Excel |
 | `resultados\resumo_<data>.txt` | resultados\ | Ao final de cada execução | Resumo agregado em texto simples, incluindo número de registro, computador e tempo total da execução |
 | `resultados\relatorio_<data>.html` | resultados\ | Ao final de cada execução | Relatório visual, pronto para apresentação/impressão em PDF |
@@ -112,13 +117,13 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 |---|---|
 | `Rede` | Faixa CIDR escaneada (a que esse host pertence) |
 | `IP` | Endereço IPv4 do host, direto do XML do Nmap |
-| `Hostname` | Nome resolvido pelo Nmap (nem sempre disponível) |
+| `Hostname` | Nome resolvido pelo Nmap via DNS reverso; se vazio, `Confirm-ServicosUdp` tenta preencher via nome NetBIOS (script `nbstat`, só Windows) |
 | `MAC` | Endereço físico da placa de rede |
 | `Fabricante` | Fabricante do MAC (OUI), conforme a base de dados interna do Nmap |
 | `PossivelEquipamentoRede` | `SIM` se `Fabricante` bate com uma marca de roteador/switch/AP conhecida |
 | `TipoProvavel` | Classificação detalhada — ver tabela na seção 7 |
 | `SO_Estimado` | Palpite de sistema operacional (`-O` do Nmap), pode vir vazio se não houver confiança suficiente |
-| `PortasAbertas` | Lista de `porta/protocolo(serviço versão)` de todas as portas abertas encontradas |
+| `PortasAbertas` | Lista de `porta/protocolo(serviço versão)` TCP do scan principal + portas UDP confirmadas `open` de `Confirm-ServicosUdp` |
 | `DataScan` | Timestamp da execução (`yyyy-MM-dd_HHmmss`) |
 | `NumeroRegistro` | Número de registro sequencial da execução, de `Get-ProximoNumeroRegistro` (`registro_scans.json`) |
 | `ComputadorOrigem` | Nome completo (FQDN) ou nome curto do computador de origem, de `Get-NomeComputadorCompleto` |
@@ -131,11 +136,13 @@ Ordem de avaliação (a primeira regra que bater, vale):
 
 1. [ ] MAC com bit "locally administered" ligado → **VM / dispositivo com MAC aleatorio**
 2. [ ] Fabricante vazio ou não identificado → **(fabricante nao identificado)**
-3. [ ] Fabricante em lista de marcas de rede (TP-Link, Mercusys, D-Link, Netgear, Ubiquiti, MikroTik, Cisco, Huawei, Aruba, Ruckus, Ruijie, Zyxel, Tenda, Intelbras, Multilaser, Linksys, Fortinet, Juniper, H3C, Extreme Networks, DrayTek, Actiontec, Arris, Sagemcom, Technicolor, Sercomm, Askey) → **Roteador / AP / Switch**
+3. [ ] Fabricante em lista de marcas de rede (TP-Link, Mercusys, D-Link, Netgear, Ubiquiti, MikroTik, Cisco, **Huawei Technologies** (não "Huawei" sozinho — ver seção 14, bug #8), Aruba, Ruckus, Ruijie, Zyxel, Tenda, Intelbras, Multilaser, Linksys, Fortinet, Juniper, H3C, Extreme Networks, DrayTek, Actiontec, Arris, Sagemcom, Technicolor, Sercomm, Askey) → **Roteador / AP / Switch**
 4. [ ] Fabricante em lista de chip de rede genérico (Realtek) → **Possivel impressora (verificar porta 9100/631/515)**, depois refinado pela `Confirm-Impressoras` para **Impressora confirmada** ou **PC provavel**
 5. [ ] Fabricante em lista de fabricante de contrato/ODM (Foxconn/Hon Hai, Pegatron, Quanta, Compal, Wistron, Flextronics, Jabil) → **Possivel (fabricante de contrato/ODM)**
-6. [ ] Fabricante em lista de marca de PC/servidor (Gigabyte, ASUSTek, ASRock, MSI, Dell, Hewlett Packard, Lenovo, Supermicro, Elitegroup, Biostar, Intel Corporate) → **PC / Servidor**
-7. [ ] Nenhuma regra bateu → **Nao classificado**
+6. [ ] Fabricante em lista de marca só-celular/tablet (Samsung Electronics, Xiaomi, OPPO, vivo Mobile, OnePlus, Motorola Mobility, LG Electronics, Murata, TCT Mobile, Sony Mobile, HMD Global, Honor Device, Realme) → **Celular / Tablet (provavel)**
+7. [ ] Fabricante em lista de marca de PC/servidor (Gigabyte, ASUSTek, ASRock, MSI, Dell, Hewlett Packard, Lenovo, Supermicro, Elitegroup, Biostar, Intel Corporate) → **PC / Servidor**
+8. [ ] Fabricante em lista ambígua PC-ou-móvel (Apple, Google, Huawei Device) → usa `SO_Estimado` como desempate: `iOS`/`iPhone`/`iPad`/`Android` → **Celular / Tablet (provavel)**; `Mac OS`/`macOS` → **PC / Servidor**; sem SO estimado → **PC ou Celular/Tablet (verificar manualmente)**
+9. [ ] Nenhuma regra bateu → **Nao classificado**
 
 ---
 
@@ -227,6 +234,29 @@ Depois da auditoria da seção 12, o mecanismo de progresso evoluiu de uma barra
 - [x] **🟡 Média — spinner/barra apareciam como retângulos vazios ("tofu")** no console real, mesmo sem erro de execução. Causa: codepage do console não estava em UTF-8. Corrigido com `chcp.com 65001` + `[Console]::OutputEncoding = [Text.Encoding]::UTF8` logo após a autoelevação, com fallback silencioso (`try/catch`) se o console não suportar.
 - [x] **🟡 Média — fase longa do Nmap desalinhava a tabela inteira.** Nomes como `Parallel DNS resolution of N hosts.` (mais compridos que a coluna) estouravam para o lado e quebravam o alinhamento de todas as colunas seguintes daquela linha. Corrigido com `Format-TextoTruncado`, aplicado antes de qualquer padding/centralização.
 - [x] **🟢 Baixa — `-Rede` com múltiplas faixas não sobrevivia à autoelevação.** `Start-Process -File` (usado no relançamento elevado) não faz o split automático de vírgula que o parser do PowerShell faz numa invocação direta (`-Rede a,b`). Corrigido normalizando `$Rede` logo após o `param()` (`$_ -split ','`), cobrindo os dois casos de entrada.
+
+---
+
+## 14. Auditoria completa — 16/09/2026, rodada 3 (precisão para apresentação executiva)
+
+Revisão linha a linha de todo o script (~1400 linhas), motivada pelo requisito explícito de que os resultados seriam apresentados à diretoria — toda alegação no relatório precisa ser sustentável por dado real, não suposição.
+
+### Bugs corrigidos
+
+- [x] **🔴 Crítica (introduzido na sessão anterior) — celulares Huawei classificados como roteador.** `$FabricantesEquipamentoRede` tinha só `"Huawei"` (substring), que também batia em `"Huawei Device Co."` (fabricante de celular vindo do Nmap) — e a checagem de equipamento de rede roda ANTES da checagem de celular/tablet na ordem de `Get-TipoProvavel`. Corrigido trocando para `"Huawei Technologies"` (string mais específica, só bate na divisão de redes/roteadores da empresa).
+- [x] **🟡 Média — confirmação de impressora falhava silenciosamente com DNS reverso.** A regex `Nmap scan report for (\S+)` em `Confirm-Impressoras` capturava o **hostname**, não o IP, quando a linha vinha como `Nmap scan report for impressora.local (192.168.1.5)` (formato do Nmap quando o DNS reverso resolve um nome). A comparação seguinte (`$_.IP -eq $ipBloco`) nunca batia nesses casos, deixando o dispositivo preso em "Possível impressora" para sempre. Corrigido para extrair o IP de dentro dos parênteses quando presente, ou direto quando não há hostname. Testado com os dois casos isoladamente.
+- [x] **🟢 Baixa — mensagem de retry cortada na tabela.** `"erro de driver, tentando de novo"` (33 caracteres) estourava a coluna de status (24 caracteres). Encurtado para `"erro driver, retry..."`.
+
+### Resposta à pergunta "o script identifica IPs não autorizados?"
+
+**Não — e isso precisa constar explicitamente na apresentação.** O script faz inventário + heurística de suspeita (fabricante de equipamento de rede, DHCP duplicado), não comparação contra uma lista de dispositivos autorizados. Não existe baseline de MACs esperados. A afirmação defensável é "N dispositivos ativos, X com características de equipamento de rede não documentado, Y com DHCP duplicado" — não "N dispositivos não autorizados". Implementar uma baseline real (`dispositivos_autorizados.json` comparado contra o inventário) foi avaliado e **adiado a pedido do usuário**; fica como item de backlog.
+
+### Melhorias de cobertura implementadas
+
+- [x] **`Confirm-ServicosUdp`** (nova função): scan UDP focado (portas 53/67/68/123/135/137/138/139/161/162/177/427/500/514/520/631/1900/3702/5353/5355) contra todos os hosts já ativos, com `-Pn`. Só soma em `PortasAbertas` portas com estado `open` confirmado (nunca `open|filtered`, que é ambíguo) — decisão deliberada para não inflar o relatório com dados incertos.
+- [x] **Hostname via NetBIOS**: mesma função roda `--script nbstat` (porta 137/udp) e extrai `NetBIOS name:` da saída para preencher `Hostname` em máquinas Windows quando o DNS reverso não resolve.
+- [x] **`Test-DnsReversoDisponivel`** (nova função): testa reversão PTR real (`[Net.Dns]::GetHostEntry`) contra até 8 IPs ativos, a partir do PC que roda o scan, e reporta resultado concreto (quantos resolveram, quais servidores DNS estão configurados) no resumo e no HTML — substitui suposição por dado verificável.
+- [x] **Avaliado e adiado a pedido:** `-Pn` no scan TCP principal (garantiria que nenhum host com todas as sondagens de descoberta bloqueadas ficasse fora do inventário) — mantido desligado pelo custo de tempo numa faixa /24 completa.
 
 ---
 
