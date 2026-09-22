@@ -12,8 +12,8 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 - [ ] **Sistema operacional:** Windows (usa APIs .NET/Win32 específicas do Windows — não roda em Linux/Mac)
 - [ ] **PowerShell:** Windows PowerShell 5.1 (built-in em qualquer Windows 10/11) — não precisa do PowerShell 7/Core
 - [ ] **Privilégios de administrador local** — o script se autoeleva sozinho (dispara UAC), mas a conta precisa ter direito de virar admin
-- [ ] **Nmap 7.x + Npcap** — instalado automaticamente pelo script se não existir; pode também ser pré-instalado ou colocado manualmente na pasta `nmap\`
-- [ ] **Conexão com a internet** — necessária **somente** se o Nmap ainda não estiver instalado (para baixar o instalador, ~34 MB). Execuções seguintes no mesmo PC não precisam de internet
+- [ ] **Nmap 7.x + Npcap** — instalado automaticamente pelo script se não existir (sempre a versão mais recente disponível em `nmap.org`, com checagem semanal de atualização); pode também ser pré-instalado ou colocado manualmente na pasta `nmap\`
+- [ ] **Conexão com a internet** — necessária para instalar o Nmap na primeira vez, e recomendável periodicamente para a checagem semanal de atualização (falha na checagem não bloqueia a execução — o script segue com a versão já instalada)
 - [ ] **Espaço em disco livre** — ideal 10-15 GB de folga (instalador do Nmap + margem operacional do Windows; o script já falhou uma vez em campo por disco quase cheio)
 - [ ] **Adaptador de rede ativo** (cabo com link ou Wi-Fi conectado) no momento da execução — sem isso não há o que detectar
 
@@ -38,24 +38,28 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 1. [ ] Força TLS 1.2/1.3 na sessão do PowerShell
 2. [ ] Verifica se está rodando como Administrador — se não, **se autoeleva** (relança a si mesmo elevado) e encerra a instância não-elevada
 3. [ ] Procura o `nmap.exe`: primeiro no PATH do sistema, depois numa pasta `nmap\` ao lado do script
-4. [ ] Se não encontrar: baixa o instalador oficial de `nmap.org`, **valida a assinatura digital**, instala silenciosamente (`/S`), confirma que o executável existe depois de instalar
+4. [ ] Se não encontrar: descobre a versão mais recente em `nmap.org/download.html`, baixa o instalador oficial dessa versão, **valida a assinatura digital**, instala silenciosamente (`/S`), confirma que o executável existe depois de instalar. Se já encontrou uma instalação existente, checa (no máximo 1x/semana, throttle em `atualizacao_nmap.json`) se há versão mais nova e atualiza sozinho quando houver
+4.5. [ ] Tenta adicionar o `nmap.exe`/pasta do Npcap às exclusões do Windows Defender (`Add-MpPreference`) — reduz lentidão/instabilidade do NIS durante o scan; se não conseguir (política corporativa), avisa e segue mesmo assim
 5. [ ] Cria a pasta `resultados\` se ainda não existir
 6. [ ] **Se `-Rede` não foi passado:** detecta a(s) rede(s) local(is) automaticamente via .NET, com espera de até ~30s (tentando a cada 3s) caso o DHCP ainda não tenha terminado de atribuir IP
 7. [ ] Compara a(s) rede(s) detectada(s) com o histórico em `redes_conhecidas.json`:
    - Se **todas** já são conhecidas e `-Forcar` não foi passado → avisa e **encerra sem escanear**
    - Se há rede(s) **nova(s)** → prossegue só com as novas (ou com todas, se `-Forcar`)
 8. [ ] Para cada adaptador físico envolvido: roda a checagem de **DHCP não autorizado** (resolve o nome de interface que o Nmap reconhece via `nmap --iflist`, casando pelo IP; roda `nmap --script broadcast-dhcp-discover --script-timeout 20s`, com saída ao vivo no console e limite de 20s pra não travar esperando resposta que não vem)
-9. [ ] Dispara **um `nmap.exe` por faixa de rede, todos ao mesmo tempo** (via `Start-Process`, não bloqueante, sem passar por `cmd.exe`), cada um com saída redirecionada para um arquivo temporário próprio; enquanto os processos rodam, o script desenha uma **tabela de log com bordas** no console (uma linha por evento de cada faixa — fase iniciada, marco de %, conclusão), com a linha da fase em andamento sendo **reescrita no próprio lugar** (via posicionamento absoluto do cursor) a cada ~300ms, e congelada como linha permanente quando a fase muda ou a faixa termina
-10. [ ] Lê o XML gerado e monta uma linha por host ativo (`status=up`), extraindo IP, MAC, fabricante, hostname, portas abertas, SO estimado
+9. [ ] Para cada faixa, roda uma **descoberta de hosts vivos** (`nmap -sn -T4`, via ARP em rede local) — até 3 tentativas se o XML sair corrompido. Constrói a lista de IPs vivos encontrados
+9.1. [ ] Dispara **um `nmap.exe` de scan profundo por faixa, todos ao mesmo tempo** (via `Start-Process`, não bloqueante, sem passar por `cmd.exe`), mirando **só os IPs vivos** da faixa (via `-iL`, nunca a faixa CIDR inteira), cada um com saída redirecionada para um arquivo temporário próprio; enquanto os processos rodam, o script desenha uma **tabela de log com bordas** no console (uma linha por evento de cada faixa — fase iniciada, marco de %, conclusão), com a linha da fase em andamento sendo **reescrita no próprio lugar** (via posicionamento absoluto do cursor) a cada ~300ms, e congelada como linha permanente quando a fase muda ou a faixa termina. Se um processo falhar (código de saída != 0) ou passar de 90 minutos numa única tentativa (watchdog de tempo de parede — protege contra o processo "rastejar" sem terminar nem cair), é reiniciado automaticamente, até 5 tentativas por faixa, sem nunca abandonar host nenhum
+10. [ ] Lê o XML gerado e monta uma linha por host ativo (`status=up`), extraindo IP, MAC, fabricante, hostname, portas abertas, SO estimado. Se o XML de uma faixa saiu corrompido (processo morreu no meio da escrita, mesmo após esgotar as tentativas), essa faixa é pulada com aviso — as demais continuam normalmente
 11. [ ] Classifica cada host em um **Tipo Provável** (roteador/switch, PC/servidor, fabricante de contrato, MAC aleatório, etc.) cruzando o fabricante do MAC com listas conhecidas + checagem bit a bit do MAC
 12. [ ] Roda uma **confirmação extra de impressoras** (`nmap -Pn -p 9100,631,515`) só nos hosts cujo fabricante é ambíguo (chip de rede genérico tipo Realtek) — o `-Pn` evita falso negativo em impressoras com ICMP/ping bloqueado
 13. [ ] Roda uma **checagem de serviços UDP + nome NetBIOS** (`nmap -sU -Pn -p <lista> --script nbstat`) contra todos os hosts já encontrados — soma portas UDP confirmadas abertas em `PortasAbertas` e preenche `Hostname` via NetBIOS quando o DNS reverso não resolve
 14. [ ] Testa **de verdade** (não supõe) se a rede tem DNS reverso funcional, resolvendo uma amostra de até 8 IPs ativos via `[Net.Dns]::GetHostEntry` a partir do próprio PC do scan
 15. [ ] Marca a(s) faixa(s) recém-escaneada(s) como "conhecida(s)" em `redes_conhecidas.json`
-16. [ ] Exporta o inventário completo em CSV
-17. [ ] Gera o **resumo em texto** (contagens, alertas, top fabricantes/SOs, diagnóstico de DNS reverso)
-18. [ ] Gera o **relatório visual em HTML** (cards, tabelas, destaques, card de diagnóstico de DNS reverso)
-19. [ ] Mostra a mensagem final de conclusão e **pausa a janela** (não fecha sozinha) até apertar Enter — tanto em sucesso quanto em erro
+16. [ ] Atualiza o **histórico de dispositivos** (`historico_dispositivos.json`, por MAC/IP) e calcula quantos são novos nas últimas 24h/7 dias/30 dias
+17. [ ] Atualiza o **log de confiabilidade** (`log_confiabilidade.json`) com quantas faixas precisaram de retry nesta execução
+18. [ ] Exporta o inventário completo em CSV (com checkpoints intermediários após cada etapa de enriquecimento, para não perder dados se uma etapa posterior falhar)
+19. [ ] Gera o **resumo em texto** (contagens, alertas, top fabricantes/SOs, diagnóstico de DNS reverso, dispositivos novos, confiabilidade da execução)
+20. [ ] Gera o **relatório visual em HTML** (cards, tabelas, destaques, diagnóstico de DNS reverso, dispositivos novos, confiabilidade da execução)
+21. [ ] Mostra a mensagem final de conclusão e **pausa a janela** (não fecha sozinha) até apertar Enter — tanto em sucesso quanto em erro
 
 ---
 
@@ -70,7 +74,14 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 | `Get-NomeComputadorCompleto` | Resolve o nome completo (FQDN) do computador de origem, com fallback para o nome curto do Windows |
 | `Test-DnsReversoDisponivel` | Testa de verdade (resolução PTR real) se a rede tem DNS reverso funcional, contra uma amostra de IPs ativos |
 | `Invoke-NmapCapturado` | Roda o Nmap capturando stdout+stderr juntos sem deixar avisos em stderr virarem erro fatal do PowerShell (ver seção 12) |
-| `Install-Nmap` | Baixa, valida assinatura digital, e instala o Nmap silenciosamente |
+| `Get-VersaoNmapMaisRecente` | Descobre a versão mais recente do Nmap disponível em `nmap.org/download.html` (regex sobre o link do instalador) |
+| `Get-VersaoNmapInstalada` | Lê a versão do `nmap.exe` já instalado (`nmap -V`) |
+| `Test-DeveChecarAtualizacaoNmap` / `Save-ChecagemAtualizacaoNmap` | Throttle semanal da checagem de atualização (`atualizacao_nmap.json`) |
+| `Install-Nmap` | Baixa (a versão mais recente, ou uma especificada), valida assinatura digital, e instala o Nmap silenciosamente |
+| `Add-ExcecaoDefenderNmap` | Tenta adicionar o Nmap/Npcap às exclusões do Windows Defender (reduz lentidão/instabilidade do NIS); falha silenciosamente com aviso se não puder (política corporativa) |
+| `Get-HostsVivos` | Fase 1 do scan: descoberta rápida de hosts vivos numa faixa via `nmap -sn` (ARP), com até 3 tentativas |
+| `Update-HistoricoDispositivos` | Atualiza `historico_dispositivos.json` (1ª/última vez visto por MAC/IP) e calcula quantos dispositivos são novos nas últimas 24h/7d/30d |
+| `Save-LogConfiabilidade` | Registra, por execução, quantas faixas precisaram de retry e quantas tentativas extras foram gastas (`log_confiabilidade.json`, últimas 50 execuções) |
 | `Test-EquipamentoDeRede` | Verifica se o fabricante do MAC bate com marca conhecida de roteador/switch/AP |
 | `Test-MacLocalmenteAdministrado` | Checa o bit "locally administered" do MAC (identifica endereço aleatório/spoofed) |
 | `Get-TipoProvavel` | Classifica o tipo provável de dispositivo (roteador, PC, impressora, ODM, etc.) |
@@ -99,8 +110,13 @@ Documento de referência exaustivo: tudo que o script usa, tudo que ele faz, e c
 |---|---|---|---|
 | `redes_conhecidas.json` | Pasta do script | Após o primeiro scan completo | Lista de redes CIDR já escaneadas, com data da 1ª e última vez, e quantas vezes |
 | `registro_scans.json` | Pasta do script | Na primeira execução | Contador do número de registro sequencial (`UltimoNumero`) |
+| `atualizacao_nmap.json` | Pasta do script | Na primeira checagem de atualização | Data/hora da última checagem de versão do Nmap (throttle semanal) |
+| `historico_dispositivos.json` | Pasta do script | Após o primeiro scan completo | 1ª/última vez visto de cada dispositivo (por MAC, ou IP se MAC ausente), quantas vezes visto |
+| `log_confiabilidade.json` | Pasta do script | Na primeira execução | Histórico das últimas 50 execuções: faixas com retry, tentativas extras, faixas com erro final |
 | `nmap\nmap.exe` | Pasta do script (opcional) | Manual, se você quiser evitar o download automático | Cópia local do Nmap |
-| `resultados\scan_<rede>_<data>.xml` | resultados\ | A cada faixa escaneada (em paralelo) | Saída bruta e completa do Nmap (formato XML) |
+| `resultados\descoberta_<rede>_<data>.xml` | resultados\ | Temporário, durante a fase 1 (descoberta) de cada faixa | Saída do `nmap -sn` — **apagado automaticamente** logo após a leitura |
+| `resultados\vivos_<rede>_<data>.txt` | resultados\ | Temporário, durante a fase 2 (scan profundo) de cada faixa | Lista de IPs vivos usada como alvo via `-iL` — **apagado automaticamente** ao final da faixa |
+| `resultados\scan_<rede>_<data>.xml` | resultados\ | A cada faixa escaneada (em paralelo, fase 2) | Saída bruta e completa do Nmap (formato XML) |
 | `resultados\dhcp_check_<adaptador>_<data>.txt` | resultados\ | A cada checagem de DHCP | Saída bruta do script NSE `broadcast-dhcp-discover` |
 | `resultados\confirmacao_impressoras_<data>.txt` | resultados\ | Quando há suspeitos de impressora | Saída do scan focado nas portas 9100/631/515 |
 | `resultados\udp_check_<data>.txt` | resultados\ | Ao final de cada execução (se houver hosts ativos) | Saída do scan UDP focado + script `nbstat` |
@@ -171,7 +187,7 @@ Ordem de avaliação (a primeira regra que bater, vale):
 - [ ] Não mapeia topologia física (qual cabo entra em qual porta de switch) — só mostra dispositivos com IP ativo
 - [ ] Detecção de SO é um palpite estatístico, não garantido
 - [ ] Classificação de tipo de dispositivo (`TipoProvavel`) é heurística baseada em fabricante/MAC — não é uma identificação definitiva, é um direcionador para investigação manual
-- [ ] Versão do Nmap fixada em `7.95` no código (atualizável manualmente na função `Install-Nmap`)
+- [ ] Um host individualmente problemático (alta perda de pacote/latência) pode fazer sua faixa demorar bem mais que o normal (minutos a até ~1h em casos extremos observados) — não trava o restante da rede, mas também não é abandonado (ver seção 15)
 
 ---
 
@@ -257,6 +273,35 @@ Revisão linha a linha de todo o script (~1400 linhas), motivada pelo requisito 
 - [x] **Hostname via NetBIOS**: mesma função roda `--script nbstat` (porta 137/udp) e extrai `NetBIOS name:` da saída para preencher `Hostname` em máquinas Windows quando o DNS reverso não resolve.
 - [x] **`Test-DnsReversoDisponivel`** (nova função): testa reversão PTR real (`[Net.Dns]::GetHostEntry`) contra até 8 IPs ativos, a partir do PC que roda o scan, e reporta resultado concreto (quantos resolveram, quais servidores DNS estão configurados) no resumo e no HTML — substitui suposição por dado verificável.
 - [x] **Avaliado e adiado a pedido:** `-Pn` no scan TCP principal (garantiria que nenhum host com todas as sondagens de descoberta bloqueadas ficasse fora do inventário) — mantido desligado pelo custo de tempo numa faixa /24 completa.
+
+---
+
+## 15. Evolução técnica — 21-22/09/2026 (persistência, auto-atualização e correção do travamento de horas)
+
+Motivada por relatos reais em campo: execuções passando de 2h e travando com `Got nsock WRITE error #10107` (erro de driver Npcap), exigindo fechamento manual da janela. Objetivo explícito: mais persistência (nunca desistir de um host), mais velocidade, mais precisão — tudo refletido no relatório.
+
+### Recursos novos
+- [x] **Auto-atualização do Nmap**: `Get-VersaoNmapMaisRecente` faz scraping de `nmap.org/download.html`; `Test-DeveChecarAtualizacaoNmap`/`Save-ChecagemAtualizacaoNmap` fazem throttle semanal (`atualizacao_nmap.json`); `Install-Nmap` aceita a versão como parâmetro. Testado ao vivo contra o site real, atualizando 7.95 → 7.991 com sucesso.
+- [x] **Exceção automática no Windows Defender**: `Add-ExcecaoDefenderNmap` tenta `Add-MpPreference -ExclusionProcess`/`-ExclusionPath` para o Nmap e a pasta do Npcap; falha silenciosamente (com aviso) se a máquina for gerenciada por política corporativa.
+- [x] **Histórico de dispositivos** (`Update-HistoricoDispositivos`, `historico_dispositivos.json`): rastreia 1ª/última vez visto por MAC (fallback IP), calcula quantos dispositivos são novos nas últimas 24h/7d/30d. Testado isoladamente em duas execuções simuladas, contagem e persistência corretas.
+- [x] **Log de confiabilidade** (`Save-LogConfiabilidade`, `log_confiabilidade.json`): histórico das últimas 50 execuções (faixas com retry, tentativas extras, faixas com erro final), com tendência histórica exibida no relatório.
+- [x] **Proteção contra XML corrompido**: `[xml]$scanXml = Get-Content $xmlPath -Raw` envolvido em try/catch — antes, um XML truncado (processo do Nmap morto no meio da escrita) lançava exceção que, com `$ErrorActionPreference = "Stop"` no escopo do script, derrubava a execução **inteira**, descartando os resultados já coletados de todas as outras faixas. Bug real reproduzido em campo (`Fim de arquivo inesperado... elementos nao fechados: nmaprun`).
+- [x] **Persistência de 1 para 5 tentativas**: `TentouNovamente` (booleano, só para erro `nsock`) virou `TentativasFeitas` (contador, até `$maxTentativasNmap = 5`), retentando para **qualquer** código de saída não-zero — decisão explícita do usuário ("não quero que o scanner desista").
+- [x] **`--host-timeout` avaliado e rejeitado** a pedido explícito do usuário: abandonaria hosts genuinamente lentos (mas reais) do inventário, o que conflita direto com o objetivo de "trazer todos os hosts".
+
+### Diagnóstico do travamento de horas (root cause), passo a passo
+
+Cada hipótese foi testada contra a rede real de produção, não só inferida por leitura de código:
+
+1. **Descartada — escala da rede.** `nmap -sn` na `/24` inteira (256 endereços) achou os hosts reais em ~7,5s. A rede não é grande o bastante para explicar horas de execução.
+2. **Descartada — os hosts vivos isoladamente.** Rodar o comando de produção exato (`-T4 -O -sV --osscan-guess`) só contra os hosts já confirmados vivos completou em ~6min, sem erro.
+3. **Confirmada — sondar endereço morto em profundidade.** Reproduzindo o cenário real (scan profundo na `/24` inteira, incluindo os ~240 endereços sem host) reproduziu o travamento: **5h44min**, falha após esgotar as 5 tentativas, `nsock WRITE error #10107` recorrente. Sondagem profunda contra endereço morto gera muito mais retransmissão/timeout do que contra um host vivo respondendo — multiplicado por ~240 endereços, sobrecarrega o Npcap.
+4. **Primeira correção (arquitetura de 2 fases)**: `Get-HostsVivos` (fase 1, `-sn`/ARP) descobre todos os vivos primeiro; a fase 2 (`-O -sV --osscan-guess -Pn -iL <lista>`) escaneia só esses, nunca mais tocando endereço morto. Testado: reduziu o problema, mas ainda travava — desta vez isolado a **dois hosts específicos** da rede (não mais o padrão geral de sondar endereço morto).
+5. **Segunda correção (taxa de envio)**: `-T4` mandava pacote mais rápido do que o Npcap aguentava nesta máquina, mesmo com o alvo já reduzido aos vivos. Trocado por `--max-retries 2 --max-rate 150`. Testado de ponta a ponta contra os 10 hosts vivos reais da rede: **10/10 com relatório completo, zero ocorrência de `nsock` em todo o log**. Um host individualmente problemático ainda pode ser bem mais lento que os demais (observado: ~59min para 2 hosts específicos, contra ~4min para os outros 8) — mas termina, não trava.
+6. **Watchdog de tempo por tentativa**: uma primeira tentativa de detecção de travamento comparava fase+percentual entre iterações do loop (se não mudasse por N minutos, mata o processo). **Descartada por teste real** — o percentual reportado pelo Nmap pode oscilar levemente mesmo travado, driblando essa checagem; o scan continuou preso além do limite configurado sem disparar o watchdog. Substituída por um corte simples de **tempo de parede por tentativa** (`$tetoTentativaMin = 90`): mais simples, e comprovadamente eficaz nos testes (disparou corretamente aos 30/60min nos testes anteriores à correção da taxa de envio).
+
+### Metodologia de validação
+Cada mudança foi testada contra a faixa `/24` de produção real através de um harness que carrega só as funções do script (sem disparar a autoelevação UAC) e invoca a função de scan paralelo diretamente — não apenas revisão de código. Resultados numéricos de cada iteração (tempo total, hosts encontrados, tentativas gastas, presença/ausência de erro de driver) foram conferidos antes de cada mudança seguinte ser aplicada.
 
 ---
 

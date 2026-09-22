@@ -14,8 +14,12 @@ Script PowerShell que detecta e mapeia automaticamente toda a rede local, gerand
 ## ✨ O que ele faz
 
 - **Detecta a rede local automaticamente** (IP + máscara → CIDR), sem precisar informar nada na mão — funciona em qualquer rede, em qualquer computador, sem valores fixos no código
-- **Instala o Nmap sozinho** se não estiver presente, validando a **assinatura digital** do instalador antes de rodar
+- **Instala e atualiza o Nmap sozinho** — baixa sempre a versão mais recente (checagem semanal automática), validando a **assinatura digital** do instalador antes de rodar
+- **Descobre todos os hosts vivos primeiro, depois escaneia a fundo só esses** — evita desperdiçar sondagem pesada em endereço morto, o que reduz drasticamente o tempo total e a chance de erro de driver numa rede `/24` inteira
+- **Persistente de verdade**: se uma faixa falhar (erro de driver) ou travar (sem terminar nem cair, passando de um teto de tempo), o scanner reinicia automaticamente aquela faixa — até 5 tentativas, sem nunca abandonar host nenhum
 - **Escaneia toda a rede** (hosts ativos, MAC, fabricante, SO estimado, portas/serviços abertos)
+- **Rastreia dispositivos novos** — histórico por MAC/IP aponta quantos dispositivos apareceram pela primeira vez nas últimas 24h/7 dias/30 dias, o sinal mais forte para infraestrutura recém-conectada
+- **Tenta reduzir interferência do Windows Defender** automaticamente durante o scan (exceção de exclusão para Nmap/Npcap), quando a máquina permite
 - **Classifica o tipo provável de cada dispositivo** (roteador/switch/AP, PC/servidor, celular/tablet, impressora, fabricante de contrato/ODM, MAC aleatório/spoofed) cruzando o fabricante do MAC com listas conhecidas
 - **Confirma impressoras e serviços UDP automaticamente** (portas 9100/631/515 para impressora; DNS/DHCP/SNMP/mDNS/SSDP e nome NetBIOS via UDP), evitando falsos positivos e preenchendo hostname mesmo sem DNS reverso configurado
 - **Detecta servidor DHCP não autorizado** — alerta quando mais de um servidor responde na mesma rede, indício forte de roteador/AP clandestino
@@ -29,7 +33,7 @@ Script PowerShell que detecta e mapeia automaticamente toda a rede local, gerand
 
 - Windows 10/11 com Windows PowerShell 5.1 (já vem instalado)
 - Privilégios de administrador local (o script pede elevação sozinho via UAC)
-- Conexão com a internet **apenas na primeira execução** (para baixar o Nmap, caso não esteja instalado)
+- Conexão com a internet na primeira execução (para baixar o Nmap) e, idealmente, periodicamente depois (checagem semanal de atualização — sem internet, o script segue normalmente com a versão já instalada)
 
 ## 🚀 Uso
 

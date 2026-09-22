@@ -8,6 +8,16 @@ redes_conhecidas.json
 # Contador do numero de registro dos scans - especifico do ambiente de cada execucao.
 registro_scans.json
 
+# Data da ultima checagem de atualizacao do Nmap - especifico do ambiente de cada execucao.
+atualizacao_nmap.json
+
+# Historico de dispositivos ja vistos (MAC/IP, 1a/ultima vez) - dados reais da rede
+# de quem executa, mesma razao do resultados/.
+historico_dispositivos.json
+
+# Log de confiabilidade (retries/erros por execucao) - especifico do ambiente de cada execucao.
+log_confiabilidade.json
+
 # Copia local do Nmap (opcional, usada so para evitar o download automatico).
 # Nao redistribuir o binario de terceiros junto do repositorio.
 nmap/

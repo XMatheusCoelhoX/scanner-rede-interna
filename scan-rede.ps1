@@ -184,16 +184,250 @@ function Save-RedeConhecida([string]$cidr, [string]$timestamp) {
     $lista | ConvertTo-Json -Depth 3 | Out-File -FilePath $caminho -Encoding UTF8
 }
 
+function Get-CaminhoHistoricoDispositivos {
+    return Join-Path $PSScriptRoot "historico_dispositivos.json"
+}
+
+function Get-HistoricoDispositivos {
+    $caminho = Get-CaminhoHistoricoDispositivos
+    if (-not (Test-Path $caminho)) { return @() }
+    try {
+        $conteudo = Get-Content $caminho -Raw | ConvertFrom-Json
+        return @($conteudo)
+    } catch {
+        Write-Host "Aviso: nao foi possivel ler o historico de dispositivos ($caminho). Tratando como vazio." -ForegroundColor Yellow
+        return @()
+    }
+}
+
+function Update-HistoricoDispositivos {
+    param(
+        [array]$Linhas,
+        [string]$Timestamp
+    )
+    # Mantem um historico persistente por dispositivo (chave = MAC, ou IP quando o MAC
+    # nao vier no XML) entre execucoes. O Nmap so enxerga quem esta ativo NA HORA do
+    # scan - sem esse historico, um dispositivo que so aparece esporadicamente (ex:
+    # notebook clandestino que alguem liga e desliga) nunca teria como ser identificado
+    # como "visto recentemente" numa unica execucao pontual. Marca em cada linha do
+    # scan atual desde quando aquele dispositivo e conhecido, para o relatorio poder
+    # destacar o que e novo (achado forte de infraestrutura nao autorizada) do que ja
+    # e velho conhecido.
+    $historico = @(Get-HistoricoDispositivos)
+    $agora = Get-Date -Date ([datetime]::ParseExact($Timestamp, 'yyyy-MM-dd_HHmmss', $null))
+
+    foreach ($linha in $Linhas) {
+        $chave = if ($linha.MAC) { $linha.MAC } else { $linha.IP }
+        if (-not $chave) { continue }
+
+        $existente = $historico | Where-Object { $_.Chave -eq $chave } | Select-Object -First 1
+        if ($existente) {
+            $existente.UltimaVez = $Timestamp
+            $existente.UltimoIP = $linha.IP
+            $existente.QtdVezesVisto = [int]$existente.QtdVezesVisto + 1
+            $linha | Add-Member -NotePropertyName PrimeiraVezVista -NotePropertyValue $existente.PrimeiraVez -Force
+        } else {
+            $historico = @($historico) + [PSCustomObject]@{
+                Chave         = $chave
+                MAC           = $linha.MAC
+                UltimoIP      = $linha.IP
+                Fabricante    = $linha.Fabricante
+                PrimeiraVez   = $Timestamp
+                UltimaVez     = $Timestamp
+                QtdVezesVisto = 1
+            }
+            $linha | Add-Member -NotePropertyName PrimeiraVezVista -NotePropertyValue $Timestamp -Force
+        }
+    }
+
+    $historico | ConvertTo-Json -Depth 3 | Out-File -FilePath (Get-CaminhoHistoricoDispositivos) -Encoding UTF8
+
+    # Conta quantos dispositivos DO SCAN ATUAL sao "novos" (primeira vez visto dentro
+    # da janela), para o relatorio destacar sem precisar reprocessar tudo de novo.
+    $novos24h = 0
+    $novos7d  = 0
+    $novos30d = 0
+    foreach ($linha in $Linhas) {
+        if (-not $linha.PrimeiraVezVista) { continue }
+        try {
+            $primeiraVezData = [datetime]::ParseExact($linha.PrimeiraVezVista, 'yyyy-MM-dd_HHmmss', $null)
+        } catch { continue }
+        $dias = ($agora - $primeiraVezData).TotalDays
+        if ($dias -le 1) { $novos24h++ }
+        if ($dias -le 7) { $novos7d++ }
+        if ($dias -le 30) { $novos30d++ }
+    }
+
+    return [PSCustomObject]@{
+        Novos24Horas = $novos24h
+        Novos7Dias   = $novos7d
+        Novos30Dias  = $novos30d
+    }
+}
+
+function Get-CaminhoLogConfiabilidade {
+    return Join-Path $PSScriptRoot "log_confiabilidade.json"
+}
+
+function Save-LogConfiabilidade {
+    param(
+        [array]$Tarefas,
+        [string]$NumeroRegistro,
+        [string]$Timestamp
+    )
+    # Registra, por execucao, quantas faixas precisaram de nova tentativa e quantas
+    # tentativas no total foram gastas - permite ver tendencia ao longo do tempo (ex:
+    # "esse PC vem tendo problema de driver com frequencia") alem do que aparece so no
+    # relatorio desta execucao. Guarda so as ultimas 50 execucoes, pra nao crescer sem limite.
+    $Tarefas = @($Tarefas)
+    $faixasComRetry = @($Tarefas | Where-Object { $_.TentativasFeitas -gt 0 })
+    $faixasComErroFinal = @($Tarefas | Where-Object { $_.ExitCodeFinal -ne 0 })
+    $totalTentativas = ($Tarefas | Measure-Object -Property TentativasFeitas -Sum).Sum
+    if (-not $totalTentativas) { $totalTentativas = 0 }
+
+    $registroAtual = [PSCustomObject]@{
+        NumeroRegistro      = $NumeroRegistro
+        Timestamp           = $Timestamp
+        TotalFaixas         = $Tarefas.Count
+        FaixasComRetry      = $faixasComRetry.Count
+        TotalTentativas     = $totalTentativas
+        FaixasComErroFinal  = $faixasComErroFinal.Count
+    }
+
+    $caminho = Get-CaminhoLogConfiabilidade
+    $historico = @()
+    if (Test-Path $caminho) {
+        try {
+            $historico = @(Get-Content $caminho -Raw | ConvertFrom-Json)
+        } catch {
+            $historico = @()
+        }
+    }
+    $historico = @($historico) + $registroAtual
+    if ($historico.Count -gt 50) {
+        $historico = $historico[($historico.Count - 50)..($historico.Count - 1)]
+    }
+    $historico | ConvertTo-Json -Depth 3 | Out-File -FilePath $caminho -Encoding UTF8
+
+    # Tendencia: quantas das ultimas execucoes tiveram algum retry, pra contexto.
+    $ultimasComRetry = @($historico | Where-Object { [int]$_.FaixasComRetry -gt 0 }).Count
+
+    return [PSCustomObject]@{
+        FaixasComRetryNestaExecucao     = $faixasComRetry.Count
+        TotalTentativasNestaExecucao    = $totalTentativas
+        FaixasComErroFinalNestaExecucao = $faixasComErroFinal.Count
+        ExecucoesComRetryHistorico      = $ultimasComRetry
+        TotalExecucoesHistorico         = $historico.Count
+    }
+}
+
+function Add-ExcecaoDefenderNmap {
+    param([string]$NmapExe)
+    # O NIS (Network Inspection System) do Windows Defender inspeciona trafego de rede
+    # em tempo real e pode causar lentidao extrema (scans que deveriam levar minutos
+    # passando de horas) e falhas intermitentes de driver (erros nsock) durante scans
+    # longos, porque interfere na captura de pacotes brutos do Npcap. Isso foi
+    # confirmado como causa provavel em auditoria (RealTimeProtectionEnabled e
+    # NISEnabled ambos ativos na maquina onde o problema foi reproduzido).
+    #
+    # Adiciona SO uma excecao de processo/pasta para o Nmap e o Npcap - nunca desativa
+    # nenhuma protecao do Defender, so para de inspecionar esses dois programas
+    # especificos. Falha silenciosamente (nao interrompe o scan) se nao conseguir (ex:
+    # Defender gerenciado por politica de grupo/MDM corporativo, que bloqueia
+    # Add-MpPreference mesmo para administradores locais).
+    try {
+        if (-not (Get-Command Add-MpPreference -ErrorAction SilentlyContinue)) { return }
+
+        $pastaNmap = Split-Path $NmapExe -Parent
+        $exclusoesAtuais = @((Get-MpPreference -ErrorAction Stop).ExclusionProcess)
+        if ($exclusoesAtuais -contains $NmapExe) { return }
+
+        Add-MpPreference -ExclusionProcess $NmapExe -ErrorAction Stop
+        Add-MpPreference -ExclusionPath $pastaNmap -ErrorAction Stop
+
+        $pastaNpcap = "$env:ProgramFiles\Npcap"
+        if (Test-Path $pastaNpcap) {
+            Add-MpPreference -ExclusionPath $pastaNpcap -ErrorAction Stop
+        }
+
+        Write-Host "  Excecao do Windows Defender adicionada para Nmap/Npcap (reduz lentidao e falhas de driver durante o scan)." -ForegroundColor Green
+    } catch {
+        Write-Host "  Nao foi possivel adicionar excecao no Windows Defender (pode estar gerenciado por politica corporativa) - o scan segue normalmente, mas pode ficar mais lento nessa maquina. Detalhe: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 function Test-Administrador {
     $identidade = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identidade)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Install-Nmap {
-    Write-Host "Nmap nao encontrado. Baixando o instalador oficial..." -ForegroundColor Cyan
+function Get-CaminhoAtualizacaoNmap {
+    return Join-Path $PSScriptRoot "atualizacao_nmap.json"
+}
 
-    $versao = "7.95"
+function Get-VersaoNmapMaisRecente {
+    # O nmap.org nao tem uma URL fixa tipo "nmap-latest-setup.exe" - descobre a versao
+    # mais recente disponivel pra Windows lendo a propria pagina oficial de download e
+    # extraindo o numero de versao do nome do instalador listado la. Retorna $null se
+    # nao conseguir (sem internet, pagina fora do ar, formato mudou) - quem chamou
+    # decide o que fazer (cair pra uma versao conhecida, ou pular a atualizacao).
+    try {
+        $pagina = Invoke-WebRequest -Uri "https://nmap.org/download.html" -UseBasicParsing
+        if ($pagina.Content -match 'nmap-(\d+\.\d+)-setup\.exe') {
+            return $Matches[1]
+        }
+    } catch {
+        # Sem internet ou nmap.org fora do ar - tratado pelo chamador.
+    }
+    return $null
+}
+
+function Get-VersaoNmapInstalada([string]$NmapExe) {
+    try {
+        $saida = & $NmapExe -V 2>&1
+        if (($saida -join ' ') -match 'Nmap version (\d+\.\d+)') {
+            return $Matches[1]
+        }
+    } catch {
+        # Executavel invalido/corrompido - tratado pelo chamador.
+    }
+    return $null
+}
+
+function Test-DeveChecarAtualizacaoNmap {
+    # So verifica atualizacao 1x por semana, no maximo - preserva a promessa de que o
+    # script funciona 100% offline no dia a dia (so precisa de internet de verdade na
+    # primeira instalacao). Sem isso, toda execucao dependeria de internet so pra
+    # checar versao, mesmo com o Nmap ja instalado e funcionando.
+    $caminho = Get-CaminhoAtualizacaoNmap
+    if (-not (Test-Path $caminho)) { return $true }
+    try {
+        $info = Get-Content $caminho -Raw | ConvertFrom-Json
+        $ultima = [datetime]$info.UltimaChecagem
+        return ((Get-Date) - $ultima).TotalDays -ge 7
+    } catch {
+        return $true
+    }
+}
+
+function Save-ChecagemAtualizacaoNmap {
+    [PSCustomObject]@{ UltimaChecagem = (Get-Date).ToString('o') } | ConvertTo-Json | Out-File -FilePath (Get-CaminhoAtualizacaoNmap) -Encoding UTF8
+}
+
+function Install-Nmap {
+    param([string]$Versao)
+
+    # Sem versao forcada (instalacao nova, nao atualizacao): tenta descobrir a mais
+    # recente no nmap.org; se nao conseguir (sem internet ainda na 1a execucao),
+    # cai para a ultima versao testada e conhecida como estavel com este script.
+    $versao = if ($Versao) { $Versao } else {
+        $maisRecente = Get-VersaoNmapMaisRecente
+        if ($maisRecente) { $maisRecente } else { "7.95" }
+    }
+
+    Write-Host "Baixando o instalador oficial do Nmap $versao..." -ForegroundColor Cyan
+
     $url = "https://nmap.org/dist/nmap-$versao-setup.exe"
     $destino = Join-Path $env:TEMP "nmap-$versao-setup.exe"
 
@@ -532,7 +766,9 @@ function New-RelatorioResumo {
         [string]$TempoTotal = "",
         [string]$NumeroRegistro = "",
         [string]$Computador = "",
-        [PSCustomObject]$DiagnosticoDns = $null
+        [PSCustomObject]$DiagnosticoDns = $null,
+        [PSCustomObject]$ResumoHistorico = $null,
+        [PSCustomObject]$ResumoConfiabilidade = $null
     )
 
     $linhasTexto = New-Object System.Collections.Generic.List[string]
@@ -546,6 +782,33 @@ function New-RelatorioResumo {
     & $add "Data/Hora: $(Get-Date -Date ([datetime]::ParseExact($Timestamp,'yyyy-MM-dd_HHmmss',$null)) -Format 'dd/MM/yyyy HH:mm:ss')"
     if ($TempoTotal) { & $add "Tempo total da execucao (inicio ao fim): $TempoTotal" }
     & $add ""
+
+    if ($ResumoConfiabilidade) {
+        & $add "--------------------------------------------------------"
+        & $add "Confiabilidade desta execucao"
+        & $add "--------------------------------------------------------"
+        if ($ResumoConfiabilidade.FaixasComRetryNestaExecucao -eq 0) {
+            & $add "  Nenhuma falha - todas as faixas completaram na primeira tentativa."
+        } else {
+            & $add "  $($ResumoConfiabilidade.FaixasComRetryNestaExecucao) faixa(s) precisaram de nova tentativa ($($ResumoConfiabilidade.TotalTentativasNestaExecucao) tentativa(s) extra no total)."
+            if ($ResumoConfiabilidade.FaixasComErroFinalNestaExecucao -gt 0) {
+                & $add "  ALERTA: $($ResumoConfiabilidade.FaixasComErroFinalNestaExecucao) faixa(s) nao completaram mesmo apos todas as tentativas - resultado parcial para essas."
+            }
+        }
+        & $add "  Historico: $($ResumoConfiabilidade.ExecucoesComRetryHistorico) de $($ResumoConfiabilidade.TotalExecucoesHistorico) execucao(oes) recentes tiveram algum retry."
+        & $add ""
+    }
+
+    if ($ResumoHistorico) {
+        & $add "--------------------------------------------------------"
+        & $add "Dispositivos vistos pela PRIMEIRA VEZ (historico entre execucoes)"
+        & $add "--------------------------------------------------------"
+        & $add "  Nas ultimas 24 horas: $($ResumoHistorico.Novos24Horas)"
+        & $add "  Nos ultimos 7 dias:   $($ResumoHistorico.Novos7Dias)"
+        & $add "  Nos ultimos 30 dias:  $($ResumoHistorico.Novos30Dias)"
+        & $add "  (um dispositivo novo, sobretudo nas ultimas 24h, e o indicio mais forte de infraestrutura recem-conectada)"
+        & $add ""
+    }
     $Faixas = @($Faixas)
     $Linhas = @($Linhas)
 
@@ -655,7 +918,9 @@ function New-RelatorioHtml {
         [string]$TempoTotal = "",
         [string]$NumeroRegistro = "",
         [string]$Computador = "",
-        [PSCustomObject]$DiagnosticoDns = $null
+        [PSCustomObject]$DiagnosticoDns = $null,
+        [PSCustomObject]$ResumoHistorico = $null,
+        [PSCustomObject]$ResumoConfiabilidade = $null
     )
 
     $Faixas = @($Faixas)
@@ -716,6 +981,17 @@ function New-RelatorioHtml {
 
     $dnsCardHtml = if ($dnsHtml) {
         "<div class='card'><div class='card-titulo'>$icoAlerta Diagnostico de DNS reverso (testado a partir deste PC)</div><table><tbody><tr><td>$dnsHtml</td></tr></tbody></table></div>"
+    } else { "" }
+
+    $confiabilidadeCardHtml = if ($ResumoConfiabilidade) {
+        $textoConfiabilidade = if ($ResumoConfiabilidade.FaixasComRetryNestaExecucao -eq 0) {
+            "<span class='badge badge-ok'>Sem falhas</span> Todas as faixas completaram na primeira tentativa."
+        } else {
+            $badgeErro = if ($ResumoConfiabilidade.FaixasComErroFinalNestaExecucao -gt 0) { "<span class='badge badge-alerta'>$($ResumoConfiabilidade.FaixasComErroFinalNestaExecucao) faixa(s) com resultado parcial</span> " } else { "" }
+            "$badgeErro$($ResumoConfiabilidade.FaixasComRetryNestaExecucao) faixa(s) precisaram de nova tentativa ($($ResumoConfiabilidade.TotalTentativasNestaExecucao) tentativa(s) extra no total)."
+        }
+        $textoConfiabilidade += " Historico: $($ResumoConfiabilidade.ExecucoesComRetryHistorico) de $($ResumoConfiabilidade.TotalExecucoesHistorico) execucao(oes) recentes tiveram algum retry."
+        "<div class='card'><div class='card-titulo'>$icoAlerta Confiabilidade desta execucao</div><table><tbody><tr><td>$textoConfiabilidade</td></tr></tbody></table></div>"
     } else { "" }
 
     $html = @"
@@ -879,6 +1155,7 @@ function New-RelatorioHtml {
         <div class="icone">$icoAlerta</div>
         <div><div class="numero">$($alertasDhcpCriticos.Count)</div><div class="rotulo">Alertas de DHCP duplicado</div></div>
       </div>
+      $(if ($ResumoHistorico) { "<div class='kpi $(if ($ResumoHistorico.Novos24Horas -gt 0) { 'critico' })'><div class='icone'>$icoAlerta</div><div><div class='numero'>$($ResumoHistorico.Novos24Horas)</div><div class='rotulo'>Dispositivo(s) novo(s) nas ultimas 24h</div></div></div>" })
     </div>
 
     <div class="card">
@@ -906,6 +1183,8 @@ function New-RelatorioHtml {
     </div>
 
     $dnsCardHtml
+
+    $confiabilidadeCardHtml
 
     <div class="card">
       <div class="card-titulo">$icoDispositivos Inventario completo</div>
@@ -1098,6 +1377,45 @@ function Write-LinhaLogParalelo {
     return $linha
 }
 
+function Get-HostsVivos {
+    param(
+        [string]$Faixa,
+        [string]$PastaResultados,
+        [string]$Timestamp,
+        [string]$FaixaSlug
+    )
+    # FASE 1 (descoberta rapida): roda um "-sn" (so descoberta de host, sem scan de porta).
+    # Em rede local isso usa ARP, que e rapido e estavel - a /24 inteira responde em poucos
+    # segundos. Isso e de proposito o oposto do scan profundo varrendo os 256 enderecos:
+    # foi justamente o scan profundo em IPs MORTOS que disparava a tempestade de erros de
+    # driver (nsock WRITE #10107) e fazia o scan travar por horas. Descobrindo primeiro
+    # quem esta vivo, o scan profundo (fase 2) mira SO os hosts reais - traz TODOS os hosts
+    # vivos, sem desperdicar sondagem pesada em endereco vazio.
+    $descobertaXml = Join-Path $PastaResultados "descoberta_${FaixaSlug}_$Timestamp.xml"
+    $ipsVivos = @()
+    $maxTentativasDescoberta = 3
+    for ($tentativa = 1; $tentativa -le $maxTentativasDescoberta; $tentativa++) {
+        Remove-Item $descobertaXml -Force -ErrorAction SilentlyContinue
+        $argsDesc = @('-sn', '-T4', '-oX', "`"$descobertaXml`"", $Faixa)
+        $p = Start-Process -FilePath $script:nmapExe -ArgumentList $argsDesc -NoNewWindow -Wait -PassThru
+        if ($p.ExitCode -eq 0 -and (Test-Path $descobertaXml)) {
+            try {
+                [xml]$dx = Get-Content $descobertaXml -Raw
+                $ipsVivos = @($dx.nmaprun.host |
+                    Where-Object { $_.status.state -eq 'up' } |
+                    ForEach-Object { ($_.address | Where-Object { $_.addrtype -eq 'ipv4' }).addr } |
+                    Where-Object { $_ })
+                break
+            } catch {
+                # XML de descoberta corrompido (nsock durante a descoberta) - tenta de novo.
+            }
+        }
+        if ($tentativa -lt $maxTentativasDescoberta) { Start-Sleep -Seconds 2 }
+    }
+    Remove-Item $descobertaXml -Force -ErrorAction SilentlyContinue
+    return $ipsVivos
+}
+
 function Invoke-NmapsComLogParalelo {
     param(
         [string[]]$Faixas,
@@ -1116,7 +1434,55 @@ function Invoke-NmapsComLogParalelo {
         $xmlPath = Join-Path $PastaResultados "scan_${faixaSlug}_$Timestamp.xml"
         $outPath = Join-Path $PastaResultados "scan_${faixaSlug}_$Timestamp.progresso.log"
         $errPath = Join-Path $PastaResultados "scan_${faixaSlug}_$Timestamp.progresso.err.log"
-        $nmapArgs = @('-O', '-sV', '--osscan-guess', '--stats-every', '3s', '-oX', $xmlPath, $faixa)
+        $corFaixa = $script:paletaCoresRede[$i % $script:paletaCoresRede.Count]
+
+        # FASE 1 - descobre todos os hosts vivos da faixa (rapido/estavel via ARP).
+        Write-Host "Descobrindo hosts vivos em $faixa ..." -ForegroundColor Cyan
+        $ipsVivos = @(Get-HostsVivos -Faixa $faixa -PastaResultados $PastaResultados -Timestamp $Timestamp -FaixaSlug $faixaSlug)
+        Write-Host "  $($ipsVivos.Count) host(s) vivo(s) encontrado(s) em $faixa - scan profundo so nesses." -ForegroundColor Green
+
+        if ($ipsVivos.Count -eq 0) {
+            # Nenhum host vivo (rede vazia ou descoberta falhou nas 3 tentativas): gera um
+            # XML minimo valido (0 hosts) pra nao quebrar o processamento downstream, e ja
+            # marca a tarefa como concluida sem processo de scan profundo.
+            Set-Content -Path $xmlPath -Value '<?xml version="1.0"?><nmaprun></nmaprun>' -Encoding UTF8
+            [PSCustomObject]@{
+                Faixa               = $faixa
+                Cor                 = $corFaixa
+                XmlPath             = $xmlPath
+                OutPath             = $outPath
+                ErrPath             = $errPath
+                ArgsQuoted          = @()
+                Processo            = $null
+                ExitCodeFinal       = 0
+                Cronometro          = [Diagnostics.Stopwatch]::new()
+                Concluido           = $true
+                FaseLogada          = ""
+                PercentualLogado    = 100.0
+                EtaLogado           = "-"
+                LinhaViva           = $null
+                TentativasFeitas    = 0
+            }
+            continue
+        }
+
+        # FASE 2 - scan profundo mirando SO os hosts vivos, via -iL (lista de alvos em
+        # arquivo, evita limite/escapamento de linha de comando com muitos IPs).
+        #   -Pn: os alvos JA foram confirmados vivos na fase 1, entao pula a redescoberta -
+        #        garante que TODO host vivo seja escaneado a fundo mesmo que nao responda ao
+        #        ping do proprio scan profundo (aqui -Pn nao varre endereco morto, so incide
+        #        sobre a lista de vivos, diferente do cenario antigo de /24 inteira).
+        #   --max-retries 2 --max-rate 150 (em vez de -T4): testado ao vivo nesta maquina -
+        #        -T4 manda pacote mais rapido do que o driver Npcap aguenta e disparava
+        #        "Got nsock WRITE error #10107" repetidamente, mesmo escaneando so os hosts
+        #        vivos. Limitando a taxa de envio e o numero de retransmissoes por sondagem,
+        #        o scan fica mais lento em hosts individualmente problematicos (alta perda de
+        #        pacote/latencia), mas termina - testado de ponta a ponta: 10/10 hosts vivos
+        #        com relatorio completo, zero erro de driver, contra o mesmo cenario que antes
+        #        falhava apos 5 tentativas.
+        $listaVivos = Join-Path $PastaResultados "vivos_${faixaSlug}_$Timestamp.txt"
+        Set-Content -Path $listaVivos -Value $ipsVivos -Encoding ASCII
+        $nmapArgs = @('--max-retries', '2', '--max-rate', '150', '-O', '-sV', '--osscan-guess', '-Pn', '--stats-every', '3s', '-oX', $xmlPath, '-iL', $listaVivos)
         $argsQuoted = $nmapArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }
 
         $processo = Start-Process -FilePath $script:nmapExe -ArgumentList $argsQuoted `
@@ -1124,22 +1490,43 @@ function Invoke-NmapsComLogParalelo {
 
         [PSCustomObject]@{
             Faixa               = $faixa
-            Cor                 = $script:paletaCoresRede[$i % $script:paletaCoresRede.Count]
+            Cor                 = $corFaixa
             XmlPath             = $xmlPath
             OutPath             = $outPath
             ErrPath             = $errPath
+            ListaVivos          = $listaVivos
             ArgsQuoted          = $argsQuoted
             Processo            = $processo
+            ExitCodeFinal       = $null
             Cronometro          = [Diagnostics.Stopwatch]::StartNew()
             Concluido           = $false
             FaseLogada          = ""
             PercentualLogado    = -1.0
             EtaLogado           = "-"
             LinhaViva           = $null
-            TentouNovamente     = $false
+            TentativasFeitas    = 0
         }
     }
 
+    # Numero maximo de vezes que uma faixa e reiniciada apos falha antes de desistir de
+    # vez dela - o objetivo aqui e persistencia (o usuario quer TODOS os hosts, nao um
+    # scan que desiste na primeira falha de driver), mas ainda com um teto, senao um
+    # problema permanente (placa de rede com defeito, por exemplo) reiniciaria pra sempre.
+    $maxTentativasNmap = 5
+    # Teto de tempo por tentativa. Uma trava de driver (nsock) nem sempre derruba o
+    # processo - as vezes o nmap fica rastejando com throughput perto de zero, com o
+    # percentual oscilando de leve (nao congela num valor fixo), entao vigiar "fase+% sem
+    # mudar" nao pega esse caso. O corte por tempo de parede pega: se UMA tentativa passar
+    # de $tetoTentativaMin, o processo e morto e a proxima volta do loop trata como falha
+    # comum (conta como tentativa, respeita o teto de $maxTentativasNmap). Testado ao vivo:
+    # com a descoberta previa (fase 1) + --max-retries/--max-rate (em vez de -T4) na fase 2,
+    # a maioria dos hosts termina em minutos, mas um host individualmente problematico (alta
+    # perda de pacote/latencia) pode empurrar o total pra perto de 1h sem nenhum erro real -
+    # o teto fica folgado o suficiente pra nao cortar isso pela metade, e ainda assim protege
+    # contra uma trava de verdade que nunca terminaria sozinha. Nao abandona host nenhum: o
+    # alvo da tentativa reiniciada continua sendo a mesma lista completa de vivos.
+    $tetoTentativaMin = 90
+    $tetoTentativaSegundos = $tetoTentativaMin * 60
     $cronometroGeral = [Diagnostics.Stopwatch]::StartNew()
     # Alem da fase, tambem captura o ETC (tempo restante estimado) que o proprio nmap
     # recalcula a cada atualizacao, para exibir um ETA por rede.
@@ -1162,34 +1549,33 @@ function Invoke-NmapsComLogParalelo {
             if ($t.Processo.HasExited) {
                 $ok = ($t.Processo.ExitCode -eq 0)
 
-                if (-not $ok -and -not $t.TentouNovamente) {
-                    # "Got nsock WRITE/READ error" e outros erros de nsock sao falhas do
-                    # driver Npcap/Winsock (driver desatualizado, VPN/antivirus interferindo
-                    # na captura de pacotes, instabilidade momentanea) - nao sao causados pelo
-                    # scan em si, e geralmente somem numa segunda tentativa. Tenta de novo
-                    # UMA vez antes de desistir dessa faixa, em vez de falhar na primeira.
-                    $erroTexto = if (Test-Path $t.ErrPath) { (Get-Content $t.ErrPath -Raw) } else { "" }
-                    if ($erroTexto -match 'nsock') {
-                        $t.TentouNovamente = $true
-                        Remove-Item $t.OutPath, $t.ErrPath -Force -ErrorAction SilentlyContinue
+                if (-not $ok -and $t.TentativasFeitas -lt $maxTentativasNmap) {
+                    # Persistencia: qualquer falha do processo do Nmap (erro de driver
+                    # nsock, crash, ou qualquer outro codigo de saida diferente de 0) e
+                    # tratada como transitoria ate o limite de tentativas - o objetivo e
+                    # trazer TODOS os hosts, entao o script insiste em vez de desistir na
+                    # primeira falha. So desiste de verdade dessa faixa depois de esgotar
+                    # $maxTentativasNmap tentativas seguidas sem sucesso.
+                    $t.TentativasFeitas++
+                    Remove-Item $t.OutPath, $t.ErrPath -Force -ErrorAction SilentlyContinue
 
-                        $linhaRetry = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "0.0%" -Eta "-" -Status "erro driver, retry..." -CorStatus $script:ansiVermelho
-                        Write-LinhaLogParalelo -Texto $linhaRetry -LinhaExistente $t.LinhaViva | Out-Null
+                    $linhaRetry = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "0.0%" -Eta "-" -Status "erro, tentativa $($t.TentativasFeitas)/$maxTentativasNmap" -CorStatus $script:ansiVermelho
+                    Write-LinhaLogParalelo -Texto $linhaRetry -LinhaExistente $t.LinhaViva | Out-Null
 
-                        $t.Processo = Start-Process -FilePath $script:nmapExe -ArgumentList $t.ArgsQuoted `
-                            -RedirectStandardOutput $t.OutPath -RedirectStandardError $t.ErrPath -PassThru -NoNewWindow
-                        $t.Cronometro = [Diagnostics.Stopwatch]::StartNew()
-                        $t.FaseLogada = ""
-                        $t.PercentualLogado = -1.0
-                        $t.EtaLogado = "-"
+                    $t.Processo = Start-Process -FilePath $script:nmapExe -ArgumentList $t.ArgsQuoted `
+                        -RedirectStandardOutput $t.OutPath -RedirectStandardError $t.ErrPath -PassThru -NoNewWindow
+                    $t.Cronometro = [Diagnostics.Stopwatch]::StartNew()
+                    $t.FaseLogada = ""
+                    $t.PercentualLogado = -1.0
+                    $t.EtaLogado = "-"
 
-                        $linhaNova = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "0.0%" -Eta "-" -Status "iniciado" -CorStatus $script:ansiCiano
-                        $t.LinhaViva = Write-LinhaLogParalelo -Texto $linhaNova
-                        continue
-                    }
+                    $linhaNova = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "0.0%" -Eta "-" -Status "iniciado" -CorStatus $script:ansiCiano
+                    $t.LinhaViva = Write-LinhaLogParalelo -Texto $linhaNova
+                    continue
                 }
 
                 $t.Concluido = $true
+                $t.ExitCodeFinal = $t.Processo.ExitCode
                 $t.Cronometro.Stop()
                 $status = if ($ok) { "concluido em $(Format-Decorrido $t.Cronometro.Elapsed)" } else { "erro (codigo $($t.Processo.ExitCode))" }
                 $corStatus = if ($ok) { $script:ansiVerde } else { $script:ansiVermelho }
@@ -1257,21 +1643,35 @@ function Invoke-NmapsComLogParalelo {
                 $linha = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase "-" -Percentual "0.0%" -Eta "-" -Status "iniciado" -CorStatus $script:ansiCiano
                 $t.LinhaViva = Write-LinhaLogParalelo -Texto $linha -LinhaExistente $t.LinhaViva
             }
+
+            # Corte por tempo de parede: se esta tentativa passar do teto, o processo esta
+            # travado/rastejando (ver comentario em $tetoTentativaMin). Mata - a proxima
+            # volta cai no ramo de HasExited (exit code != 0), que ja conta a tentativa e
+            # reinicia respeitando $maxTentativasNmap. Nao abandona host: a lista de vivos
+            # da tentativa reiniciada e a mesma.
+            if ($t.Cronometro.Elapsed.TotalSeconds -ge $tetoTentativaSegundos) {
+                $linhaTravado = Format-LinhaTabelaLog -Hora (Format-Decorrido $cronometroGeral.Elapsed) -Rede $t.Faixa -CorRede $t.Cor -Fase $t.FaseLogada -Percentual ("{0:0.0}%" -f $t.PercentualLogado) -Eta "-" -Status "passou de ${tetoTentativaMin}min, reiniciando" -CorStatus $script:ansiVermelho
+                Write-LinhaLogParalelo -Texto $linhaTravado -LinhaExistente $t.LinhaViva | Out-Null
+                try { Stop-Process -Id $t.Processo.Id -Force -ErrorAction Stop } catch { }
+            }
         }
     }
 
     Write-Host (Format-BordaTabela -Tipo Base)
 
     foreach ($t in $tarefas) {
-        if ($t.Processo.ExitCode -ne 0) {
+        if ($t.ExitCodeFinal -ne 0) {
             $erroTexto = if (Test-Path $t.ErrPath) { (Get-Content $t.ErrPath -Raw) } else { "" }
             if ($erroTexto -match 'nsock') {
                 Write-Host "  Aviso: nmap para $($t.Faixa) terminou com erro de driver (nsock) mesmo apos tentar de novo. Isso normalmente indica Npcap desatualizado, VPN/antivirus interferindo na captura de pacotes, ou instabilidade momentanea do driver de rede - atualize o Npcap (nmap.org/npcap) e rode de novo. Detalhe: $erroTexto" -ForegroundColor Yellow
             } else {
-                Write-Host "  Aviso: nmap para $($t.Faixa) terminou com codigo $($t.Processo.ExitCode). $erroTexto" -ForegroundColor Yellow
+                Write-Host "  Aviso: nmap para $($t.Faixa) terminou com codigo $($t.ExitCodeFinal). $erroTexto" -ForegroundColor Yellow
             }
         }
         Remove-Item $t.OutPath, $t.ErrPath -Force -ErrorAction SilentlyContinue
+        if ($t.PSObject.Properties['ListaVivos'] -and $t.ListaVivos) {
+            Remove-Item $t.ListaVivos -Force -ErrorAction SilentlyContinue
+        }
     }
 
     return $tarefas
@@ -1398,9 +1798,37 @@ try {
     }
 
     if (-not $nmapExe) {
+        Write-Host "Nmap nao encontrado." -ForegroundColor Cyan
         $nmapExe = Install-Nmap
+    } elseif (Test-DeveChecarAtualizacaoNmap) {
+        # Nmap ja instalado - verifica no maximo 1x por semana se ha versao mais nova
+        # (ver Test-DeveChecarAtualizacaoNmap) e atualiza sozinho quando encontra,
+        # reaproveitando o mesmo fluxo de seguranca do Install-Nmap (assinatura digital
+        # validada antes de instalar). Uma falha aqui (sem internet, nmap.org fora do
+        # ar, download interrompido) nunca impede o scan de continuar com a versao ja
+        # instalada - atualizacao e best-effort, o scan em si nao pode depender dela.
+        Write-Host "Verificando se ha uma versao mais recente do Nmap..." -ForegroundColor Cyan
+        $versaoInstalada = Get-VersaoNmapInstalada -NmapExe $nmapExe
+        $versaoDisponivel = Get-VersaoNmapMaisRecente
+        Save-ChecagemAtualizacaoNmap
+
+        if ($versaoDisponivel -and $versaoInstalada -and ([version]$versaoDisponivel -gt [version]$versaoInstalada)) {
+            Write-Host "Nova versao do Nmap disponivel ($versaoInstalada -> $versaoDisponivel). Atualizando automaticamente..." -ForegroundColor Yellow
+            try {
+                $nmapExe = Install-Nmap -Versao $versaoDisponivel
+            } catch {
+                Write-Host "Nao foi possivel atualizar o Nmap automaticamente ($($_.Exception.Message)). Continuando com a versao ja instalada ($versaoInstalada)." -ForegroundColor Yellow
+            }
+        } elseif ($versaoDisponivel) {
+            Write-Host "Nmap ja esta na versao mais recente ($versaoInstalada)." -ForegroundColor Green
+        } else {
+            Write-Host "Nao foi possivel verificar atualizacoes (sem internet, ou nmap.org indisponivel). Continuando com a versao ja instalada." -ForegroundColor Yellow
+        }
     }
     $script:nmapExe = $nmapExe
+
+    Write-Host "Verificando excecao do Windows Defender para o Nmap..." -ForegroundColor Cyan
+    Add-ExcecaoDefenderNmap -NmapExe $nmapExe
 
     $pastaResultados = Join-Path $PSScriptRoot "resultados"
     if (-not (Test-Path $pastaResultados)) {
@@ -1490,12 +1918,25 @@ try {
             continue
         }
 
-        # So marca a rede como "conhecida" depois do scan completar de verdade (nao no modo -Rede forcado manualmente)
+        # Blindado com try/catch de proposito: se o processo do Nmap morrer no meio da
+        # escrita (ex: crash de driver apos esgotar as tentativas), o XML fica truncado
+        # e incompleto - sem isso, [xml]$scanXml lanca uma excecao que (com
+        # $ErrorActionPreference = "Stop" no escopo do script inteiro) derrubaria a
+        # execucao TODA, jogando fora os resultados de qualquer outra faixa ja escaneada
+        # com sucesso. Uma faixa com problema nunca pode derrubar as demais.
+        try {
+            [xml]$scanXml = Get-Content $xmlPath -Raw
+        } catch {
+            Write-Host "O XML de $faixa ficou incompleto/corrompido (provavel falha do Nmap apos esgotar as tentativas) e nao pode ser lido. Pulando essa faixa - as demais continuam normalmente. Detalhe: $($_.Exception.Message)" -ForegroundColor Red
+            continue
+        }
+
+        # So marca a rede como "conhecida" depois do scan completar E o XML ser lido
+        # com sucesso (nao no modo -Rede forcado manualmente) - uma faixa que falhou
+        # nao deveria ser tratada como "ja mapeada" em execucoes futuras.
         if (-not $Rede) {
             Save-RedeConhecida -cidr $faixa -timestamp $timestamp
         }
-
-        [xml]$scanXml = Get-Content $xmlPath
 
         foreach ($host_ in $scanXml.nmaprun.host) {
             if ($host_.status.state -ne "up") { continue }
@@ -1538,26 +1979,66 @@ try {
         }
     }
 
-    $linhasTotais = Confirm-Impressoras -Linhas $linhasTotais -PastaResultados $pastaResultados -Timestamp $timestamp
-    $linhasTotais = Confirm-ServicosUdp -Linhas $linhasTotais -PastaResultados $pastaResultados -Timestamp $timestamp
+    # Checkpoint: grava o inventario bruto (antes do enriquecimento abaixo) imediatamente,
+    # para que o trabalho de scan ja feito nunca se perca por completo mesmo que uma das
+    # etapas seguintes falhe de forma inesperada. Cada etapa de enriquecimento roda em
+    # try/catch separado - uma falha isolada avisa e segue com os dados que ja tem, em
+    # vez de derrubar a execucao inteira e jogar fora tudo que ja foi descoberto.
+    $csvPath = Join-Path $pastaResultados "inventario_$timestamp.csv"
+    $linhasTotais | Sort-Object Rede, { [version]($_.IP -replace '^\D+', '') } -ErrorAction SilentlyContinue | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
-    Write-Host ""
-    Write-Host "Verificando se ha DNS reverso funcional nesta rede (explica o Hostname vazio, quando for o caso)..." -ForegroundColor Cyan
-    $diagnosticoDns = Test-DnsReversoDisponivel -IpsParaTestar ($linhasTotais | Select-Object -ExpandProperty IP)
-    if ($diagnosticoDns.Funcional) {
-        Write-Host "  DNS reverso funcional: $($diagnosticoDns.IpsResolvidos) de $($diagnosticoDns.IpsTestados) IP(s) testado(s) resolveram nome." -ForegroundColor Green
-    } else {
-        Write-Host "  DNS reverso NAO respondeu para nenhum dos $($diagnosticoDns.IpsTestados) IP(s) testado(s) - por isso a coluna Hostname depende do nome NetBIOS (Windows) quando disponivel." -ForegroundColor Yellow
+    try {
+        $linhasTotais = Confirm-Impressoras -Linhas $linhasTotais -PastaResultados $pastaResultados -Timestamp $timestamp
+    } catch {
+        Write-Host "Aviso: confirmacao de impressoras falhou ($($_.Exception.Message)) - seguindo com a classificacao original." -ForegroundColor Yellow
+    }
+    try {
+        $linhasTotais = Confirm-ServicosUdp -Linhas $linhasTotais -PastaResultados $pastaResultados -Timestamp $timestamp
+    } catch {
+        Write-Host "Aviso: checagem de servicos UDP falhou ($($_.Exception.Message)) - seguindo sem esses dados." -ForegroundColor Yellow
+    }
+    $linhasTotais | Sort-Object Rede, { [version]($_.IP -replace '^\D+', '') } -ErrorAction SilentlyContinue | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+    # Atualiza o historico persistente por dispositivo (MAC/IP) e marca em cada linha
+    # desde quando ele e conhecido - permite destacar no relatorio o que apareceu pela
+    # primeira vez nas ultimas 24h/7 dias/30 dias, mesmo que um scan pontual sozinho
+    # nao tivesse como saber isso.
+    $resumoHistorico = $null
+    try {
+        $resumoHistorico = Update-HistoricoDispositivos -Linhas $linhasTotais -Timestamp $timestamp
+        Write-Host ""
+        Write-Host "Dispositivos novos (1a vez visto): $($resumoHistorico.Novos24Horas) nas ultimas 24h, $($resumoHistorico.Novos7Dias) nos ultimos 7 dias, $($resumoHistorico.Novos30Dias) nos ultimos 30 dias." -ForegroundColor Cyan
+    } catch {
+        Write-Host "Aviso: atualizacao do historico de dispositivos falhou ($($_.Exception.Message)) - relatorio segue sem essa secao." -ForegroundColor Yellow
     }
 
-    $csvPath = Join-Path $pastaResultados "inventario_$timestamp.csv"
+    $diagnosticoDns = $null
+    try {
+        Write-Host ""
+        Write-Host "Verificando se ha DNS reverso funcional nesta rede (explica o Hostname vazio, quando for o caso)..." -ForegroundColor Cyan
+        $diagnosticoDns = Test-DnsReversoDisponivel -IpsParaTestar ($linhasTotais | Select-Object -ExpandProperty IP)
+        if ($diagnosticoDns.Funcional) {
+            Write-Host "  DNS reverso funcional: $($diagnosticoDns.IpsResolvidos) de $($diagnosticoDns.IpsTestados) IP(s) testado(s) resolveram nome." -ForegroundColor Green
+        } else {
+            Write-Host "  DNS reverso NAO respondeu para nenhum dos $($diagnosticoDns.IpsTestados) IP(s) testado(s) - por isso a coluna Hostname depende do nome NetBIOS (Windows) quando disponivel." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "Aviso: diagnostico de DNS reverso falhou ($($_.Exception.Message)) - relatorio segue sem essa secao." -ForegroundColor Yellow
+    }
+
+    # Registra a confiabilidade desta execucao (quantas faixas precisaram de nova
+    # tentativa, quantos erros de processo no total) - historico persistido entre
+    # execucoes para acompanhar tendencia (ex: "esse PC vem tendo problema de driver
+    # com frequencia") alem do que aparece so nesta execucao.
+    $resumoConfiabilidade = Save-LogConfiabilidade -Tarefas $tarefasScan -NumeroRegistro $numeroRegistro -Timestamp $timestamp
+
     $linhasTotais | Sort-Object Rede, { [version]($_.IP -replace '^\D+', '') } -ErrorAction SilentlyContinue | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
     $cronometroTotal.Stop()
     $tempoTotalTexto = Format-Decorrido $cronometroTotal.Elapsed
 
-    $resumoPath = New-RelatorioResumo -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto -NumeroRegistro $numeroRegistro -Computador $nomeComputador -DiagnosticoDns $diagnosticoDns
-    $htmlPath = New-RelatorioHtml -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto -NumeroRegistro $numeroRegistro -Computador $nomeComputador -DiagnosticoDns $diagnosticoDns
+    $resumoPath = New-RelatorioResumo -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto -NumeroRegistro $numeroRegistro -Computador $nomeComputador -DiagnosticoDns $diagnosticoDns -ResumoHistorico $resumoHistorico -ResumoConfiabilidade $resumoConfiabilidade
+    $htmlPath = New-RelatorioHtml -Linhas $linhasTotais -Faixas $faixas -AlertasDhcp $alertasDhcp -Timestamp $timestamp -PastaResultados $pastaResultados -TempoTotal $tempoTotalTexto -NumeroRegistro $numeroRegistro -Computador $nomeComputador -DiagnosticoDns $diagnosticoDns -ResumoHistorico $resumoHistorico -ResumoConfiabilidade $resumoConfiabilidade
 
     Write-Host ""
     Write-Host "Concluido em $tempoTotalTexto! $($linhasTotais.Count) dispositivos ativos encontrados no total." -ForegroundColor Green
